@@ -1,0 +1,46 @@
+{
+  "name": "sshx",
+  "version": "1.0.0",
+  "description": "Cross-platform SSH client featuring TUI, CLI, and MCP host management",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "sshx": "./bin/sshx.js"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "build:all": "bash scripts/build.sh",
+    "start": "tsx src/cli/index.ts",
+    "dev:cli": "tsx src/cli/index.ts",
+    "dev:tui": "tsx src/cli/index.ts tui",
+    "dev:mcp": "tsx src/cli/index.ts mcp",
+    "test": "npm run build && node --test test/core.test.ts test/tunnel.test.ts test/cli.test.ts test/mcp.test.ts --import tsx"
+  },
+  "keywords": [
+    "ssh",
+    "ssh-client",
+    "sftp",
+    "tunnel",
+    "terminal",
+    "tui",
+    "mcp",
+    "claude-skill",
+    "cross-platform"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "commander": "^15.0.0",
+    "socks": "^2.8.10",
+    "ssh2": "^1.17.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/ssh2": "^1.15.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
