@@ -280,7 +280,15 @@ export class TuiApp {
     try {
       await runConnect(host.id, { noExitOnError: true });
     } catch (err: any) {
-      process.stderr.write(`\n${colors.red}${err?.message || err}${colors.reset}\n`);
+      process.stdout.write(`\n${colors.yellow}Press any key to return to sshx...${colors.reset}`);
+      if (process.stdin.isTTY) {
+        await new Promise<void>((resolve) => {
+          process.stdin.setRawMode(true);
+          process.stdin.resume();
+          process.stdin.once('data', () => resolve());
+        });
+      }
+      this.hostsScreen.statusMessage = `Connection failed: ${err?.message || err}`;
     }
     this.screen.enterAltScreen();
     this.resume();

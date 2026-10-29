@@ -15,6 +15,7 @@ import {
   resolvePortablePath,
   toPortablePath
 } from '../dist/index.js';
+import { stringWidth, padClip } from '../dist/tui/screen.js';
 import { MockSSHServer } from './mock-server.ts';
 
 let mockServer: MockSSHServer;
@@ -251,3 +252,59 @@ test('TunnelManager & Port Forwarding parser', () => {
   assert.equal(dynamicSpec.localPort, 1080);
   assert.equal(dynamicSpec.type, 'dynamic');
 });
+
+test('TUI visual width: CJK fullwidth, ANSI escape sequences, padClip', () => {
+  // English ASCII: 1 visual cell each
+  assert.equal(stringWidth('hello'), 5);
+  // Chinese CJK characters: 2 visual cells each
+  assert.equal(stringWidth('66云美国'), 8);
+  assert.equal(stringWidth('美国vps家宽'), 11);
+  assert.equal(stringWidth('安邦服饰'), 8);
+
+  // ANSI escape sequences must not count towards visual width
+  assert.equal(stringWidth('\x1b[31m66云美国\x1b[0m'), 8);
+  assert.equal(stringWidth('\x1b[1;32mtest\x1b[0m'), 4);
+
+  // padClip ensures EXACT visual width
+  const padded = padClip('66云美国', 12);
+  assert.equal(stringWidth(padded), 12);
+  assert.equal(padded, '66云美国    ');
+
+  // padClip truncation with ellipsis
+  const truncated = padClip('美国vps家宽生产服务器', 10);
+  assert.equal(stringWidth(truncated), 10);
+  assert.ok(truncated.endsWith('…'));
+});
+
+test('KnownHostsManager: wire format keys, extractKeyType, and accept-new verification', () => {
+  const km = new KnownHostsManager(path.join(tempConfigDir, 'test_kh'));
+
+  // Create mock raw wire format public key for ssh-ed25519
+  // [uint32: 11][ssh-ed25519][uint32: 32][32 bytes key]
+  const typeStr = 'ssh-ed25519';
+  const typeBuf = Buffer.from(typeStr);
+  const keyRaw = Buffer.alloc(4 + typeBuf.length + 4 + 32);
+  keyRaw.writeUInt32BE(typeBuf.length, 0);
+  typeBuf.copy(keyRaw, 4);
+  keyRaw.writeUInt32BE(32, 4 + typeBuf.length);
+  keyRaw.fill(0xab, 4 + typeBuf.length + 4);
+
+  const extractedType = km.extractKeyType(keyRaw);
+  assert.equal(extractedType, 'ssh-ed25519');
+
+  // Verify accept-new adds new key
+  const res1 = km.verifyHostKey('test.server.io', 22, extractedType, keyRaw, 'accept-new');
+  assert.equal(res1.status, 'new');
+
+  // Verify same key is trusted on next connection
+  const res2 = km.verifyHostKey('test.server.io', 22, extractedType, keyRaw, 'accept-new');
+  assert.equal(res2.status, 'trusted');
+
+  // Verify changed key for same key type returns mismatch
+  const changedKeyRaw = Buffer.from(keyRaw);
+  changedKeyRaw[changedKeyRaw.length - 1] = 0xcd;
+  const res3 = km.verifyHostKey('test.server.io', 22, extractedType, changedKeyRaw, 'accept-new');
+  assert.equal(res3.status, 'mismatch');
+  assert.ok(res3.message.includes('WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED'));
+});
+

@@ -213,13 +213,6 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
   } catch (err: any) {
     connection.disconnect();
     process.stderr.write(`${colors.red}Connection failed: ${err.message || String(err)}${colors.reset}\n`);
-    const suggestions = defaultConfigManager.suggestHosts(target);
-    if (suggestions.length > 0) {
-      process.stderr.write(`\n${colors.yellow}Did you mean one of your configured hosts?${colors.reset}\n`);
-      for (const s of suggestions) {
-        process.stderr.write(`  ${colors.cyan}• ${s.name}${colors.reset} (${s.username}@${s.host}:${s.port})\n`);
-      }
-    }
     if (options.noExitOnError) {
       throw err;
     }

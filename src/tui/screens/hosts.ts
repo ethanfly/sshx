@@ -163,17 +163,20 @@ export class HostsScreen {
           padClip(last, cols.last);
         const row = listTop + i;
         if (selected) {
-          screen.writeAt(1, row, `${theme.accentBg}${theme.selectedFg}${padClip(' ' + line, screen.cols)}${colors.reset}`);
+          const selectedWidth = Math.max(10, screen.cols - 1);
+          screen.writeAt(1, row, `${theme.accentBg}${theme.selectedFg}${padClip(' ' + line, selectedWidth)}${colors.reset}`);
         } else {
           screen.writeAt(2, row, line);
         }
       });
     }
 
-    const status = this.statusMessage
-      ? `${theme.warn}${this.statusMessage}${colors.reset}`
-      : `${theme.muted}↑↓/jk move  enter connect  a add  e edit  d delete  t ping  i import  ctrl-r reload  esc quit${colors.reset}`;
-    screen.writeAt(1, footerRow, padClip(status, screen.cols));
+    const statusText = this.statusMessage
+      ? this.statusMessage
+      : '↑↓/jk move  enter connect  a add  e edit  d delete  t ping  i import  ctrl-r reload  esc quit';
+    const statusColor = this.statusMessage ? theme.warn : theme.muted;
+    const footerWidth = Math.max(10, screen.cols - 2);
+    screen.writeAt(2, footerRow, `${statusColor}${padClip(statusText, footerWidth)}${colors.reset}`);
   }
 
   public async testSelectedLatency(): Promise<void> {

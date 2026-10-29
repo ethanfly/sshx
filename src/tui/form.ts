@@ -1,5 +1,5 @@
 import readline from 'node:readline';
-import { ScreenBuffer, stripAnsi, padClip } from './screen.js';
+import { ScreenBuffer, stripAnsi, padClip, stringWidth } from './screen.js';
 import { TuiTheme } from './theme.js';
 import { colors } from '../cli/utils.js';
 
@@ -46,7 +46,8 @@ export async function runForm(
       const marker = active ? `${theme.accent}▸${colors.reset}` : ' ';
       screen.writeAt(x + 2, row, `${marker} ${theme.muted}${label}${colors.reset} ${shown}`);
       if (active) {
-        const col = x + 2 + 2 + 16 + 1 + (field.secret ? field.value.length : cursor);
+        const cursorVisualWidth = field.secret ? field.value.length : stringWidth(field.value.slice(0, cursor));
+        const col = x + 2 + 2 + 16 + 1 + cursorVisualWidth;
         screen.writeAt(Math.min(col, screen.cols), row, `${theme.accent}▍${colors.reset}`);
         screen.showCursor();
       }

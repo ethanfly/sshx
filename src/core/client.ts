@@ -157,14 +157,14 @@ export class SSHConnection {
 
     // Host key verification
     const appConfig = this.configManager.getAppConfig();
-    config.hostHash = 'sha256';
     config.hostVerifier = (keyLookup: any) => {
-      // In ssh2, keyLookup provides key buffer
+      // In ssh2 without hostHash, keyLookup provides raw public key wire buffer
       const keyBuffer = Buffer.isBuffer(keyLookup) ? keyLookup : Buffer.from(keyLookup);
+      const keyType = this.knownHostsManager.extractKeyType(keyBuffer);
       const res = this.knownHostsManager.verifyHostKey(
         this.profile.host,
         this.profile.port || 22,
-        'ssh-rsa',
+        keyType,
         keyBuffer,
         appConfig.strictHostKeyChecking
       );

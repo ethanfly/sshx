@@ -82,6 +82,26 @@ export class KnownHostsManager {
   }
 
   /**
+   * Extract key type from raw SSH wire format public key buffer
+   */
+  public extractKeyType(keyBuffer: Buffer): string {
+    if (Buffer.isBuffer(keyBuffer) && keyBuffer.length >= 4) {
+      try {
+        const typeLen = keyBuffer.readUInt32BE(0);
+        if (typeLen > 0 && 4 + typeLen <= keyBuffer.length) {
+          const type = keyBuffer.slice(4, 4 + typeLen).toString('utf8');
+          if (/^[a-zA-Z0-9@.-]+$/.test(type)) {
+            return type;
+          }
+        }
+      } catch {
+        // Fallback
+      }
+    }
+    return 'ssh-rsa';
+  }
+
+  /**
    * Verify a host key against known_hosts
    */
   public verifyHostKey(
@@ -137,6 +157,26 @@ export class KnownHostsManager {
         fingerprint,
         message: 'Host key matched known_hosts'
       };
+    }
+
+    // If host was recorded under a different key type, but never under this keyType:
+    // Under 'accept-new', accept and record this new key type for the host.
+    const sameTypeEntries = matchingEntries.filter(e => e.keyType === keyType);
+    if (sameTypeEntries.length === 0) {
+      if (mode === 'accept-new') {
+        this.addHostKey(hostIdent, keyType, keyBase64);
+        return {
+          status: 'new',
+          fingerprint,
+          message: `Permanently added '${hostIdent}' (${keyType}) to the list of known hosts.`
+        };
+      } else {
+        return {
+          status: 'mismatch',
+          fingerprint,
+          message: `Host key for '${hostIdent}' (${keyType}) is not known and StrictHostKeyChecking=yes.`
+        };
+      }
     }
 
     return {

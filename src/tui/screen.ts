@@ -60,8 +60,9 @@ export class ScreenBuffer {
     if (innerW < 1 || maxY - y < 1) return;
 
     let top = '┌' + '─'.repeat(innerW) + '┐';
-    if (title && innerW > title.length + 4) {
-      top = `┌─ ${colors.bold}${title}${colors.reset}${borderColor} ` + '─'.repeat(innerW - title.length - 4) + '┐';
+    const titleWidth = title ? stringWidth(title) : 0;
+    if (title && innerW > titleWidth + 4) {
+      top = `┌─ ${colors.bold}${title}${colors.reset}${borderColor} ` + '─'.repeat(innerW - titleWidth - 4) + '┐';
     }
     this.writeAt(x, y, `${borderColor}${top}${colors.reset}`);
 
@@ -84,8 +85,80 @@ export function stripAnsi(str: string): string {
   return str.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
 }
 
+export function charWidth(code: number): number {
+  if (code < 0x20 || (code >= 0x7f && code < 0xa0)) return 0;
+  // Combining marks
+  if (code >= 0x0300 && code <= 0x036f) return 0;
+  // CJK and fullwidth ranges
+  if (
+    (code >= 0x1100 && code <= 0x115f) || // Hangul Jamo
+    (code >= 0x2e80 && code <= 0x9fff) || // CJK Radicals, Ideographs
+    (code >= 0xac00 && code <= 0xd7a3) || // Hangul Syllables
+    (code >= 0xf900 && code <= 0xfaff) || // CJK Compatibility
+    (code >= 0xfe10 && code <= 0xfe19) || // Vertical forms
+    (code >= 0xfe30 && code <= 0xfe6f) || // CJK Compatibility Forms
+    (code >= 0xff00 && code <= 0xff60) || // Fullwidth Forms
+    (code >= 0xffe0 && code <= 0xffe6) || // Fullwidth punctuation & currency
+    (code >= 0x20000 && code <= 0x323af)  // CJK Extension B-G
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+export function stringWidth(str: string): number {
+  const plain = stripAnsi(str);
+  let width = 0;
+  for (const char of plain) {
+    width += charWidth(char.codePointAt(0) || 0);
+  }
+  return width;
+}
+
 export function padClip(text: string, width: number): string {
-  const plain = stripAnsi(text);
-  if (plain.length > width) return plain.slice(0, Math.max(0, width - 1)) + '…';
-  return plain + ' '.repeat(width - plain.length);
+  const targetWidth = Math.max(0, width);
+  let currentWidth = 0;
+  let result = '';
+  let i = 0;
+
+  while (i < text.length) {
+    // Retain ANSI escape sequences without consuming display width
+    if (text[i] === '\x1b' && text[i + 1] === '[') {
+      let j = i + 2;
+      while (j < text.length && !/[a-zA-Z]/.test(text[j])) j++;
+      if (j < text.length) {
+        result += text.slice(i, j + 1);
+        i = j + 1;
+        continue;
+      }
+    }
+
+    const code = text.codePointAt(i) || 0;
+    const char = String.fromCodePoint(code);
+    i += char.length;
+    const w = charWidth(code);
+
+    if (currentWidth + w > targetWidth) {
+      // Need to truncate. Reserve 1 cell for '…'
+      while (result.length > 0 && currentWidth + 1 > targetWidth) {
+        let lastCharLen = 1;
+        if (result.length >= 2) {
+          const high = result.charCodeAt(result.length - 2);
+          if (high >= 0xd800 && high <= 0xdbff) lastCharLen = 2;
+        }
+        const lastCode = result.codePointAt(result.length - lastCharLen) || 0;
+        currentWidth -= charWidth(lastCode);
+        result = result.slice(0, result.length - lastCharLen);
+      }
+      return targetWidth >= 1 ? result + '…' : result;
+    }
+
+    result += char;
+    currentWidth += w;
+  }
+
+  if (currentWidth < targetWidth) {
+    result += ' '.repeat(targetWidth - currentWidth);
+  }
+  return result;
 }
