@@ -16,6 +16,7 @@ import {
   toPortablePath
 } from '../dist/index.js';
 import { stringWidth, padClip } from '../dist/tui/screen.js';
+import { TuiApp } from '../dist/tui/app.js';
 import { MockSSHServer } from './mock-server.ts';
 
 let mockServer: MockSSHServer;
@@ -306,5 +307,24 @@ test('KnownHostsManager: wire format keys, extractKeyType, and accept-new verifi
   const res3 = km.verifyHostKey('test.server.io', 22, extractedType, changedKeyRaw, 'accept-new');
   assert.equal(res3.status, 'mismatch');
   assert.ok(res3.message.includes('WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED'));
+});
+
+test('TuiApp: suspend and resume lifecycle restores stdin flowing state and raw mode', () => {
+  const app = new TuiApp();
+  // suspend sets inModal and rawMode false
+  (app as any).suspend();
+  assert.equal((app as any).inModal, true);
+
+  // simulate session pausing stdin
+  process.stdin.pause();
+  assert.equal(process.stdin.isPaused(), true);
+
+  // resume must clear inModal, resume stdin flowing mode, and restore rawMode
+  (app as any).resume();
+  assert.equal((app as any).inModal, false);
+  assert.equal(process.stdin.isPaused(), false);
+
+  // Restore paused state so node test runner does not wait for stdin
+  process.stdin.pause();
 });
 

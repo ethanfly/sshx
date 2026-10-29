@@ -21,11 +21,11 @@ export class ScreenBuffer {
   }
 
   public enterAltScreen(): void {
-    process.stdout.write('\x1b[?1049h\x1b[?25l');
+    process.stdout.write('\x1b[?1049h\x1b[0m\x1b[?25l\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
   }
 
   public exitAltScreen(): void {
-    process.stdout.write('\x1b[?25h\x1b[?1049l');
+    process.stdout.write('\x1b[?25h\x1b[0m\x1b[?1049l');
   }
 
   public clear(): void {

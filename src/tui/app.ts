@@ -68,7 +68,10 @@ export class TuiApp {
           process.stdin.removeListener('keypress', onKeypress);
           process.stdout.removeListener('resize', onResize);
           this.screen.exitAltScreen();
-          if (process.stdin.isTTY) process.stdin.setRawMode(false);
+          if (process.stdin.isTTY) {
+            process.stdin.setRawMode(false);
+            process.stdin.pause();
+          }
           resolve();
         }
       }, 40);
@@ -168,11 +171,17 @@ export class TuiApp {
 
   private suspend(): void {
     this.inModal = true;
+    if (process.stdin.isTTY && process.stdin.setRawMode) {
+      process.stdin.setRawMode(false);
+    }
   }
 
   private resume(): void {
     this.inModal = false;
-    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+    if (process.stdin.isTTY && process.stdin.setRawMode) {
+      process.stdin.setRawMode(true);
+    }
+    process.stdin.resume();
   }
 
   private async addHost(): Promise<void> {
@@ -276,7 +285,6 @@ export class TuiApp {
     if (!host) return;
     this.suspend();
     this.screen.exitAltScreen();
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
     try {
       await runConnect(host.id, { noExitOnError: true });
     } catch (err: any) {
@@ -289,10 +297,13 @@ export class TuiApp {
         });
       }
       this.hostsScreen.statusMessage = `Connection failed: ${err?.message || err}`;
+    } finally {
+      this.screen.updateDimensions();
+      this.screen.enterAltScreen();
+      this.resume();
+      this.hostsScreen.refreshHosts();
+      this.render();
     }
-    this.screen.enterAltScreen();
-    this.resume();
-    this.hostsScreen.refreshHosts();
   }
 }
 
