@@ -105,6 +105,30 @@ test('ConfigManager: portable path resolution and export/import', () => {
   assert.equal(importedHost.host, '10.0.0.1');
   assert.equal(importedHost.privateKeyPath, '~/.ssh/id_rsa');
 
+  // Test OpenSSH config import with Include support
+  const sshDir = path.join(tempConfigDir, '.ssh');
+  const configD = path.join(sshDir, 'config.d');
+  fs.mkdirSync(configD, { recursive: true });
+
+  const mainConfig = path.join(sshDir, 'config');
+  fs.writeFileSync(mainConfig, 'Include config.d/*\n');
+
+  const subConfig = path.join(configD, 'hosts.conf');
+  fs.writeFileSync(subConfig, `
+Host server-alpha
+    HostName 192.168.1.100
+    User admin
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
+`);
+
+  const importedSshHosts = freshMgr.importOpenSSHConfig(mainConfig);
+  assert.equal(importedSshHosts.length, 1);
+  assert.equal(importedSshHosts[0].name, 'server-alpha');
+  assert.equal(importedSshHosts[0].host, '192.168.1.100');
+  assert.equal(importedSshHosts[0].port, 2222);
+  assert.equal(importedSshHosts[0].username, 'admin');
+
   fs.rmSync(freshConfigDir, { recursive: true, force: true });
 });
 

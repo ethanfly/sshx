@@ -394,7 +394,7 @@ export class ConfigManager {
   }
 
   /**
-   * Import hosts from OpenSSH config file (usually ~/.ssh/config)
+   * Import hosts from OpenSSH config file (usually ~/.ssh/config), supporting `Include` directives
    */
   public importOpenSSHConfig(configPath?: string): HostProfile[] {
     const targetPath = configPath ? resolvePortablePath(configPath) : path.join(os.homedir(), '.ssh', 'config');
@@ -402,8 +402,7 @@ export class ConfigManager {
       return [];
     }
 
-    const content = fs.readFileSync(targetPath, 'utf8');
-    const imported = parseOpenSSHConfig(content);
+    const imported = parseOpenSSHConfigFile(targetPath);
     const existing = this.getHosts();
 
     const result: HostProfile[] = [];
@@ -514,7 +513,115 @@ export function calculateLevenshteinDistance(a: string, b: string): number {
 }
 
 /**
- * Parses OpenSSH ~/.ssh/config format
+ * Parses OpenSSH config file resolving Include directives
+ */
+export function parseOpenSSHConfigFile(filePath: string, visited: Set<string> = new Set()): Array<Omit<HostProfile, 'id'>> {
+  const resolvedPath = resolvePortablePath(filePath);
+  if (visited.has(resolvedPath) || !fs.existsSync(resolvedPath)) {
+    return [];
+  }
+  visited.add(resolvedPath);
+
+  const baseDir = path.dirname(resolvedPath);
+  const content = fs.readFileSync(resolvedPath, 'utf8');
+  const lines = content.split('\n');
+  const hosts: Array<Omit<HostProfile, 'id'>> = [];
+  let currentHost: Partial<HostProfile> | null = null;
+
+  for (let line of lines) {
+    line = line.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    const parts = line.split(/\s+/);
+    const keyword = parts[0].toLowerCase();
+    const value = parts.slice(1).join(' ').replace(/^["']|["']$/g, '');
+
+    if (keyword === 'include') {
+      // Handle Include wildcard (e.g. config.d/*) or direct files
+      const includePattern = value.startsWith('/') || value.startsWith('~')
+        ? resolvePortablePath(value)
+        : path.resolve(baseDir, value);
+
+      const includeDir = path.dirname(includePattern);
+      const filePattern = path.basename(includePattern);
+
+      if (fs.existsSync(includeDir)) {
+        try {
+          const entries = fs.readdirSync(includeDir);
+          const regex = new RegExp('^' + filePattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
+          for (const entry of entries) {
+            if (regex.test(entry)) {
+              const fullEntryPath = path.join(includeDir, entry);
+              if (fs.statSync(fullEntryPath).isFile()) {
+                const nestedHosts = parseOpenSSHConfigFile(fullEntryPath, visited);
+                hosts.push(...nestedHosts);
+              }
+            }
+          }
+        } catch {
+          // ignore read errors
+        }
+      }
+      continue;
+    }
+
+    if (keyword === 'host') {
+      if (currentHost && currentHost.name && currentHost.name !== '*') {
+        finalizeHost(currentHost, hosts);
+      }
+      currentHost = {
+        name: value,
+        host: value,
+        port: 22,
+        username: os.userInfo().username || 'root',
+        authType: 'privateKey',
+        tags: ['imported-ssh-config']
+      };
+    } else if (currentHost) {
+      switch (keyword) {
+        case 'hostname':
+          currentHost.host = value;
+          break;
+        case 'user':
+          currentHost.username = value;
+          break;
+        case 'port':
+          currentHost.port = parseInt(value, 10) || 22;
+          break;
+        case 'identityfile':
+          currentHost.privateKeyPath = toPortablePath(value);
+          currentHost.authType = 'privateKey';
+          break;
+        case 'preferredauthentications':
+          if (value.toLowerCase().startsWith('password')) {
+            currentHost.authType = 'password';
+          }
+          break;
+        case 'proxyjump':
+          currentHost.proxyJump = value;
+          break;
+        case 'proxycommand':
+          currentHost.proxyCommand = value;
+          break;
+        case 'serveraliveinterval':
+          currentHost.keepaliveInterval = (parseInt(value, 10) || 15) * 1000;
+          break;
+        case 'serveralivecountmax':
+          currentHost.keepaliveCountMax = parseInt(value, 10) || 3;
+          break;
+      }
+    }
+  }
+
+  if (currentHost && currentHost.name && currentHost.name !== '*') {
+    finalizeHost(currentHost, hosts);
+  }
+
+  return hosts;
+}
+
+/**
+ * Parses OpenSSH ~/.ssh/config format string
  */
 export function parseOpenSSHConfig(content: string): Array<Omit<HostProfile, 'id'>> {
   const lines = content.split('\n');
