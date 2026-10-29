@@ -29,7 +29,7 @@
 ### 从源码安装（推荐）
 
 ```bash
-git clone https://github.com/OWNER/sshx.git
+git clone https://github.com/ethanfly/sshx.git
 cd sshx
 npm install
 npm run build
