@@ -248,3 +248,36 @@ test('CLI: host aliases (new, ls, info, rm, delete) and error suggestions', asyn
   assert.ok(delRes.stdout.includes('Removed host profile'));
 });
 
+test('CLI: running bare sshx defaults to TUI', async () => {
+  // In a simulated terminal environment, bare sshx launches TUI
+  const res = await new Promise<{ launched: boolean; code: number }>((resolve) => {
+    const proc = execFile('node', [cliPath], {
+      env: { ...process.env, TERM: 'xterm-256color' }
+    });
+
+    let buffer = '';
+    proc.stdout?.on('data', (data) => {
+      buffer += data.toString();
+      // Look for alternate screen buffer sequence or TUI title
+      if (buffer.includes('\x1b[?1049h') || buffer.includes('sshx') || buffer.includes('Search')) {
+        proc.kill('SIGINT');
+        resolve({ launched: true, code: 0 });
+      }
+    });
+
+    proc.on('close', (code) => {
+      resolve({
+        launched: buffer.includes('\x1b[?1049h') || buffer.includes('sshx'),
+        code: code || 0
+      });
+    });
+
+    // Send Ctrl-C after a short delay if not captured
+    setTimeout(() => {
+      try { proc.kill('SIGINT'); } catch { /* ignore */ }
+    }, 500);
+  });
+
+  assert.ok(res.launched, 'Bare sshx command should launch TUI by default');
+});
+

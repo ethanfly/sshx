@@ -27,9 +27,12 @@ export function createCli(): Command {
     .description('Cross-platform SSH client with TUI launcher, CLI, and MCP host management')
     .version('1.0.0');
 
-  // Direct connect fallback: sshx [user@]host
+  // Direct connect fallback: sshx [target] or default to TUI
   program
-    .argument('[target]', 'Target host or profile name to connect')
+    .argument('[target]', 'Target host or profile name to connect (if omitted, launches TUI)')
+    .option('-s, --search <query>', 'Pre-fill the live search query in TUI mode')
+    .option('--color <theme>', 'Color theme for TUI: default, dracula, nord, catppuccin')
+    .option('--sort <mode>', 'Sort mode for TUI: name (default), none, fancy')
     .option('-p, --port <port>', 'SSH port (default: 22)')
     .option('-u, --user <username>', 'SSH username')
     .option('-i, --identity <path>', 'Private key identity file')
@@ -43,11 +46,13 @@ export function createCli(): Command {
       if (target) {
         await runConnect(target, options);
       } else {
-        if (process.stdin.isTTY) {
-          await startTUI();
-        } else {
-          program.help();
-        }
+        const mode = String(options.sort || 'name');
+        const sort = mode === 'fancy' || mode === 'none' ? mode : 'name';
+        await startTUI({
+          search: options.search,
+          color: options.color,
+          sort
+        });
       }
     });
 
@@ -325,8 +330,14 @@ export function createCli(): Command {
   return program;
 }
 
-// Direct execution
-if (process.argv[1] && (process.argv[1].endsWith('sshx.js') || process.argv[1].endsWith('/cli/index.ts') || process.argv[1].endsWith('/cli/index.js') || process.argv[1].endsWith('cli/index.js'))) {
+// Direct execution (when run directly via node dist/cli/index.js or tsx src/cli/index.ts)
+const isDirectCli = process.argv[1] && (
+  process.argv[1].endsWith('/cli/index.ts') ||
+  process.argv[1].endsWith('/cli/index.js') ||
+  process.argv[1].endsWith('cli/index.js')
+);
+
+if (isDirectCli) {
   const program = createCli();
   program.parseAsync(process.argv).catch((err) => {
     process.stderr.write(`Fatal error: ${err.message || String(err)}\n`);

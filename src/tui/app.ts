@@ -278,7 +278,7 @@ export class TuiApp {
     this.screen.exitAltScreen();
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     try {
-      await runConnect(host.id);
+      await runConnect(host.id, { noExitOnError: true });
     } catch (err: any) {
       process.stderr.write(`\n${colors.red}${err?.message || err}${colors.reset}\n`);
     }

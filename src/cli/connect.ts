@@ -133,13 +133,18 @@ export function resolveTarget(target: string, options: ConnectCliOptions = {}): 
   };
 }
 
-export async function runConnect(target: string, options: ConnectCliOptions = {}): Promise<void> {
+export interface RunConnectOptions extends ConnectCliOptions {
+  noExitOnError?: boolean;
+}
+
+export async function runConnect(target: string, options: RunConnectOptions = {}): Promise<void> {
   let profile: HostProfile;
   try {
     profile = resolveTarget(target, options);
   } catch (err: any) {
     if (err instanceof TargetNotFoundError) {
       process.stderr.write(`${colors.red}Error: ${err.message}${colors.reset}\n`);
+      if (options.noExitOnError) throw err;
       process.exit(1);
     }
     throw err;
@@ -214,6 +219,9 @@ export async function runConnect(target: string, options: ConnectCliOptions = {}
       for (const s of suggestions) {
         process.stderr.write(`  ${colors.cyan}• ${s.name}${colors.reset} (${s.username}@${s.host}:${s.port})\n`);
       }
+    }
+    if (options.noExitOnError) {
+      throw err;
     }
     process.exit(1);
   }

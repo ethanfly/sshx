@@ -105,15 +105,22 @@ sshx host show dev
 sshx host edit dev --port 2222
 sshx host remove dev
 
-# 直接连接。已保存密码时不会再提示输入
+# 直接输入 sshx，默认直接打开交互式 TUI 启动器
+sshx
+
+# 也可以在打开 TUI 时预先输入搜索词或指定配色
+sshx -s "prod"
+sshx --color dracula
+
+# 带有目标参数时直接连接；已保存密码的主机会自动填入密码，不再询问
 sshx dev
 sshx connect prod
 
-# 不进交互界面，执行一条命令
+# 不进交互界面，直接执行一条命令
 sshx exec dev "uname -a"
 ```
 
-没有参数、并且当前是终端时，`sshx` 会打开 TUI。
+> **提示**：命令行直接输入 `sshx` 不带子命令时，默认直接进入 TUI 交互式启动器。也可显式运行 `sshx tui`。
 
 ## CLI
 
