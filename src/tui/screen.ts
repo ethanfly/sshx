@@ -130,8 +130,10 @@ export function stringWidth(str: string): number {
 
 export function padClip(text: string, width: number): string {
   const targetWidth = Math.max(0, width);
+  // Visible characters carry their cell width; ANSI escape sequences carry 0
+  const parts: Array<{ s: string; w: number; ansi: boolean }> = [];
   let currentWidth = 0;
-  let result = '';
+  let overflow = false;
   let i = 0;
 
   while (i < text.length) {
@@ -140,7 +142,7 @@ export function padClip(text: string, width: number): string {
       let j = i + 2;
       while (j < text.length && !/[a-zA-Z]/.test(text[j])) j++;
       if (j < text.length) {
-        result += text.slice(i, j + 1);
+        parts.push({ s: text.slice(i, j + 1), w: 0, ansi: true });
         i = j + 1;
         continue;
       }
@@ -152,24 +154,26 @@ export function padClip(text: string, width: number): string {
     const w = charWidth(code);
 
     if (currentWidth + w > targetWidth) {
-      // Need to truncate. Reserve 1 cell for '…'
-      while (result.length > 0 && currentWidth + 1 > targetWidth) {
-        let lastCharLen = 1;
-        if (result.length >= 2) {
-          const high = result.charCodeAt(result.length - 2);
-          if (high >= 0xd800 && high <= 0xdbff) lastCharLen = 2;
-        }
-        const lastCode = result.codePointAt(result.length - lastCharLen) || 0;
-        currentWidth -= charWidth(lastCode);
-        result = result.slice(0, result.length - lastCharLen);
-      }
-      return targetWidth >= 1 ? result + '…' : result;
+      overflow = true;
+      break;
     }
-
-    result += char;
+    parts.push({ s: char, w, ansi: false });
     currentWidth += w;
   }
 
+  if (overflow && targetWidth >= 1) {
+    // Make room for '…' by dropping visible characters only, so escape sequences stay intact
+    for (let k = parts.length - 1; k >= 0 && currentWidth + 1 > targetWidth; k--) {
+      if (!parts[k].ansi) {
+        currentWidth -= parts[k].w;
+        parts.splice(k, 1);
+      }
+    }
+    parts.push({ s: '…', w: 1, ansi: false });
+    currentWidth += 1;
+  }
+
+  let result = parts.map(p => p.s).join('');
   if (currentWidth < targetWidth) {
     result += ' '.repeat(targetWidth - currentWidth);
   }

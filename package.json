@@ -1,6 +1,6 @@
 {
   "name": "@ethanfly/sshx",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Cross-platform SSH client featuring TUI, CLI, and MCP host management",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
