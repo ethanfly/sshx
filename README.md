@@ -36,6 +36,7 @@
 - 密码、私钥（Ed25519 / RSA，可带口令）、SSH Agent 认证
 - 主机配置里保存的密码会在 CLI 和 TUI 连接时自动使用，不再询问
 - **分屏会话与实时监控看板**：连接后右侧实时展示 IP、账号、CPU、内存、硬盘、网络吞吐、NVIDIA 显卡状态；按 `F2` / `Ctrl+O` 自由折叠/展开
+- **备用屏幕与边界隔离**：采用 Alternate Screen Buffer 与 DECAWM 终端防护，无缝隔绝历史滚动遮挡，像素级边框对齐
 - **端到端加密云同步（`sshx sync`）**：支持 WebDAV（坚果云 / Nextcloud / 群晖）与 GitHub Gist，AES-256-GCM 客户端加密保护
 - 主机增删改查，标签、备注、跳板机（ProxyJump）、ProxyCommand
 - 导入 OpenSSH `~/.ssh/config`，导入 / 导出 JSON 配置
@@ -422,6 +423,21 @@ pnpm test
 ## 安全说明
 
 `hosts.json` 里的密码是明文，只靠文件权限 `0600` 保护。不要把这个文件提交到 git，也不要放进共享目录以外的不受信任位置。导出文件同样包含密码。
+
+## 版本历史
+
+### v1.1.0 (2026-10-30)
+
+- 🚀 **端到端加密云同步（`sshx sync`）**：支持 WebDAV（坚果云 / Nextcloud / 群晖）与 GitHub Gist，AES-256-GCM + Scrypt 客户端加密，TUI 支持按 `S` 快捷同步
+- ⚡ **分屏实时监控看板**：连接远程服务器后右侧自动呈现 IP、系统、CPU、内存、磁盘、网络吞吐、NVIDIA 显卡状态；支持 `F2` / `Ctrl+O` 快捷折叠/展开
+- 🖥️ **终端缓冲区隔离**：启用 Alternate Screen Buffer (`\x1b[?1049h`)，解决原终端历史命令遮挡重叠问题
+- 🎨 **终端边框字符对齐优化**：适配现代终端 Unicode 双宽 Emoji 识别与 DECAWM 自动折行防护，解决边框符号换行错位
+- 📦 **CLI 版本动态同步**：命令行版本与 `package.json` 保持动态同步
+
+### v1.0.0 (2026-10-30)
+
+- 初始正式版本发布：跨平台 TUI 交互式启动器、CLI 命令行工具、AI Agent 原生 MCP 协议支持
+- 主机配置增删改查、存密免交互直接登录、端口转发与 SFTP
 
 ## 许可
 
