@@ -4,6 +4,7 @@ import os from 'node:os';
 import { defaultConfigManager, HostProfile, resolvePortablePath } from '../core/config.js';
 import { SSHConnection } from '../core/client.js';
 import { InteractiveSession } from '../core/session.js';
+import { SplitSession } from '../core/split-session.js';
 import { TunnelManager, parsePortForwardString } from '../core/tunnel.js';
 import { colors, prompt } from './utils.js';
 
@@ -14,6 +15,7 @@ export interface ConnectCliOptions {
   password?: string;
   jump?: string;
   record?: string;
+  sidebar?: boolean;
   localForward?: string[];
   remoteForward?: string[];
   dynamicForward?: string[];
@@ -193,18 +195,17 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
       }
     }
 
-    // Launch interactive session
-    const session = new InteractiveSession(connection.getRawClient(), {
-      cols: process.stdout.columns || 80,
-      rows: process.stdout.rows || 24,
+    // Launch interactive split-pane session (Shell + Right monitor dashboard)
+    const splitSession = new SplitSession(connection.getRawClient(), {
+      enableSidebar: options.sidebar,
       recordFilePath: options.record
     });
 
-    await session.start();
-    session.attachToLocalProcess();
+    await splitSession.start();
+    splitSession.attachToLocalProcess();
 
     await new Promise<void>((resolve) => {
-      session.once('close', () => resolve());
+      splitSession.getSession().once('close', () => resolve());
     });
 
     await tm.stopAll();

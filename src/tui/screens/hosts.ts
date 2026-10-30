@@ -191,7 +191,7 @@ export class HostsScreen {
 
     const statusText = this.statusMessage
       ? this.statusMessage
-      : '↑↓/jk move  enter connect  a add  e edit  d delete  t ping  i import  ctrl-r reload  esc quit';
+      : '↑↓/jk move  enter connect  a add  e edit  d delete  t ping  S sync  i import  esc quit';
     const statusColor = this.statusMessage ? theme.warn : theme.muted;
     const footerWidth = Math.max(10, screen.cols - 2);
     screen.writeAt(2, footerRow, `${statusColor}${padClip(statusText, footerWidth)}${colors.reset}`);

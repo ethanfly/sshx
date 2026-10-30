@@ -15,6 +15,7 @@ import {
   runHostImportSshConfig
 } from './host.js';
 import { runKeygen } from './keygen.js';
+import { registerSyncCommand } from './sync.js';
 import { startTUI, TuiOptions } from '../tui/index.js';
 import { startMcpServer } from '../skill/mcp-server.js';
 import { runSkillCli } from '../skill/runner.js';
@@ -42,6 +43,8 @@ export function createCli(): Command {
     .option('-L, --local-forward <spec...>', 'Local port forwarding (e.g. 8080:localhost:80)')
     .option('-R, --remote-forward <spec...>', 'Remote port forwarding (e.g. 9000:localhost:3000)')
     .option('-D, --dynamic-forward <spec...>', 'Dynamic SOCKS5 port forwarding (e.g. 1080)')
+    .option('--sidebar', 'Show server monitor sidebar on the right during session (default: auto when width >= 90)')
+    .option('--no-sidebar', 'Disable server monitor sidebar')
     .action(async (target, options) => {
       if (target) {
         await runConnect(target, options);
@@ -69,6 +72,8 @@ export function createCli(): Command {
     .option('-L, --local-forward <spec...>', 'Local port forwarding (e.g. 8080:localhost:80)')
     .option('-R, --remote-forward <spec...>', 'Remote port forwarding (e.g. 9000:localhost:3000)')
     .option('-D, --dynamic-forward <spec...>', 'Dynamic SOCKS5 port forwarding (e.g. 1080)')
+    .option('--sidebar', 'Show server monitor sidebar on the right during session')
+    .option('--no-sidebar', 'Disable server monitor sidebar')
     .action(async (target, options, command) => {
       await runConnect(target, command.optsWithGlobals());
     });
@@ -291,6 +296,9 @@ export function createCli(): Command {
     .action(async (options) => {
       await runKeygen(options);
     });
+
+  // sync subcommand — E2EE cloud synchronization
+  registerSyncCommand(program);
 
   // TUI subcommand — sshs-style launcher
   program

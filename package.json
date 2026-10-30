@@ -35,7 +35,7 @@
     "dev:cli": "tsx src/cli/index.ts",
     "dev:tui": "tsx src/cli/index.ts tui",
     "dev:mcp": "tsx src/cli/index.ts mcp",
-    "test": "npm run build && node --test test/core.test.ts test/tunnel.test.ts test/cli.test.ts test/mcp.test.ts --import tsx"
+    "test": "npm run build && node --test test/core.test.ts test/tunnel.test.ts test/cli.test.ts test/mcp.test.ts test/sync.test.ts test/monitor.test.ts --import tsx"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

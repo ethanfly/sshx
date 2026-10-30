@@ -342,15 +342,9 @@ export class ConfigManager {
   }
 
   /**
-   * Import host profiles from a portable JSON file
+   * Import host profiles from a JSON string directly
    */
-  public importHosts(importPath: string, mode: 'merge' | 'overwrite' = 'merge'): { imported: number; updated: number; total: number } {
-    const resolved = resolvePortablePath(importPath);
-    if (!fs.existsSync(resolved)) {
-      throw new Error(`Import file not found: ${resolved}`);
-    }
-
-    const content = fs.readFileSync(resolved, 'utf8');
+  public importHostsFromJson(content: string, mode: 'merge' | 'overwrite' = 'merge'): { imported: number; updated: number; total: number } {
     const parsed = JSON.parse(content);
     if (!Array.isArray(parsed)) {
       throw new Error(`Invalid configuration format: expected an array of host profiles.`);
@@ -376,7 +370,8 @@ export class ConfigManager {
         notes: raw.notes,
         proxyJump: raw.proxyJump,
         proxyCommand: raw.proxyCommand,
-        lastConnected: raw.lastConnected
+        lastConnected: raw.lastConnected,
+        favorite: raw.favorite
       };
 
       const matchIdx = existing.findIndex(e => e.id === profile.id || e.name.toLowerCase() === profile.name.toLowerCase());
@@ -391,6 +386,19 @@ export class ConfigManager {
 
     this.saveHosts(existing);
     return { imported, updated, total: existing.length };
+  }
+
+  /**
+   * Import host profiles from a portable JSON file
+   */
+  public importHosts(importPath: string, mode: 'merge' | 'overwrite' = 'merge'): { imported: number; updated: number; total: number } {
+    const resolved = resolvePortablePath(importPath);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`Import file not found: ${resolved}`);
+    }
+
+    const content = fs.readFileSync(resolved, 'utf8');
+    return this.importHostsFromJson(content, mode);
   }
 
   /**

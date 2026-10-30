@@ -5,6 +5,7 @@ import { runForm, FormField } from './form.js';
 import { resolveTheme, TuiTheme } from './theme.js';
 import { runConnect } from '../cli/connect.js';
 import { defaultConfigManager, HostProfile } from '../core/config.js';
+import { defaultSyncManager } from '../sync/manager.js';
 import { colors } from '../cli/utils.js';
 
 export interface TuiOptions {
@@ -159,6 +160,10 @@ export class TuiApp {
       this.toggleFavorite();
       return false;
     }
+    if (str === 'S' || (key?.ctrl && key.name === 's')) {
+      await this.syncCloud();
+      return false;
+    }
     if (key?.name === 'return') {
       await this.connectSelected();
       return false;
@@ -278,6 +283,25 @@ export class TuiApp {
     defaultConfigManager.updateHost(current.id, { favorite: !current.favorite });
     this.hostsScreen.refreshHosts();
     this.hostsScreen.statusMessage = current.favorite ? `unpinned ${current.name}` : `pinned ${current.name}`;
+  }
+
+  private async syncCloud(): Promise<void> {
+    const config = defaultSyncManager.getConfig();
+    if (!config) {
+      this.hostsScreen.statusMessage = 'sync not configured (run: sshx sync setup)';
+      return;
+    }
+
+    this.hostsScreen.statusMessage = `syncing with ${config.provider}...`;
+    this.render();
+
+    try {
+      const res = await defaultSyncManager.pull();
+      this.hostsScreen.refreshHosts();
+      this.hostsScreen.statusMessage = `synced ${res.total} hosts (${res.imported} new, ${res.updated} updated)`;
+    } catch (err: any) {
+      this.hostsScreen.statusMessage = `sync failed: ${err.message || String(err)}`;
+    }
   }
 
   private async connectSelected(): Promise<void> {

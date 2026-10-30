@@ -35,6 +35,8 @@
 
 - 密码、私钥（Ed25519 / RSA，可带口令）、SSH Agent 认证
 - 主机配置里保存的密码会在 CLI 和 TUI 连接时自动使用，不再询问
+- **分屏会话与实时监控看板**：连接后右侧实时展示 IP、账号、CPU、内存、硬盘、网络吞吐、NVIDIA 显卡状态；按 `F2` / `Ctrl+O` 自由折叠/展开
+- **端到端加密云同步（`sshx sync`）**：支持 WebDAV（坚果云 / Nextcloud / 群晖）与 GitHub Gist，AES-256-GCM 客户端加密保护
 - 主机增删改查，标签、备注、跳板机（ProxyJump）、ProxyCommand
 - 导入 OpenSSH `~/.ssh/config`，导入 / 导出 JSON 配置
 - 本地转发 `-L`、远程转发 `-R`、SOCKS5 动态转发 `-D`
@@ -235,6 +237,7 @@ sshx tui --sort fancy
 | e | 编辑选中主机 |
 | d | 删除（需要输入 `yes`） |
 | t | 测试延迟 |
+| S | 云同步（WebDAV / Gist） |
 | i | 导入 `~/.ssh/config` |
 | * | 收藏 / 取消收藏 |
 | Ctrl-R | 从磁盘重新加载 |
@@ -242,6 +245,99 @@ sshx tui --sort fancy
 | Ctrl-C | 退出 |
 
 新建和编辑表单里：Tab 或 ↑↓ 切换字段，Ctrl-S 保存，Esc 取消。密码显示为 `*`。
+
+## 实时监控分屏会话
+
+连接任意主机后，`sshx` 会在窗口右侧自动开启实时系统监控看板（终端宽度 ≥ 90 列时默认开启）：
+
+```
+┌─────────────────────────────────┐
+│ ✦ sshx monitor  [F2 toggle]     │
+├─────────────────────────────────┤
+│ 📌 SYSTEM                       │
+│  User:    root                  │
+│  Host:    prod-srv-01           │
+│  IP:      10.0.0.5              │
+│  OS:      Ubuntu 24.04 LTS      │
+│  Up:      14d 6h 32m            │
+├─────────────────────────────────┤
+│ ⚡ CPU  24C · 14.2%             │
+│  AMD Ryzen 9 3900X              │
+│  [███░░░░░░░░░░░░░░░░] 14.2%    │
+├─────────────────────────────────┤
+│ 🧠 MEMORY                       │
+│  [███████████░░░░░░░░] 48%      │
+│  Used: 15.2G / 31.9G            │
+├─────────────────────────────────┤
+│ 💾 DISK (/)                     │
+│  [███░░░░░░░░░░░░░░░░] 14%      │
+│  Size: 130G / 952G              │
+├─────────────────────────────────┤
+│ 🌐 NETWORK                      │
+│  ↓ RX: 1.2 MB/s   ↑ TX: 840 KB/s│
+├─────────────────────────────────┤
+│ 🎮 GPU (NVIDIA)                 │
+│  RTX 3060 Ti (41°C)             │
+│  [████░░░░░░░░░░░░░░░] 23%      │
+│  VRAM: 856MB / 8192MB (10%)     │
+└─────────────────────────────────┘
+```
+
+- **分屏会话**：左侧为完整 PTY 远程交互终端，右侧为监视看板。
+- **快捷键**：会话中随时按 **`F2`** 或 **`Ctrl+O`**，即可一键折叠或展开右侧看板（折叠后终端铺满 100% 宽度）。
+- **命令行选项**：若不希望显示看板，添加 `--no-sidebar` 参数即可：
+  ```bash
+  sshx connect prod --no-sidebar
+  sshx prod --no-sidebar
+  ```
+
+## 云同步（sshx sync）
+
+`sshx sync` 提供**端到端加密（E2EE）**的配置同步能力。导出的主机数据在离开本机前全部使用 **AES-256-GCM + Scrypt** 通过你的主密码加密，即便第三方云盘泄露也无法解密配置、密码与私钥路径。
+
+### 1. 配置同步源
+
+```bash
+sshx sync setup
+```
+
+通过交互向导配置，支持两种提供商：
+- **WebDAV**：坚果云、Nextcloud、ownCloud、群晖 NAS、Alist 等
+- **GitHub Gist**：使用 Personal Access Token 自动创建/更新私有密文 Gist
+
+也支持直接通过命令行参数快速配置：
+
+```bash
+# 配置 WebDAV
+sshx sync setup --provider webdav \
+  --url "https://dav.jianguoyun.com/dav/sshx/" \
+  --username "your@email.com" \
+  --password "your-app-token" \
+  --passphrase "your-master-password"
+
+# 配置 GitHub Gist
+sshx sync setup --provider gist \
+  --token "ghp_your_personal_access_token" \
+  --passphrase "your-master-password"
+```
+
+### 2. 同步操作
+
+```bash
+# 将本地主机列表加密上传到云端
+sshx sync push
+
+# 从云端下载并解密合并到本地
+sshx sync pull
+
+# 覆盖本地配置（不合并）
+sshx sync pull --overwrite
+
+# 查看同步状态与远端连通性
+sshx sync status
+```
+
+> **TUI 快捷键**：在 `sshx tui` 启动器列表中直接按 **`S`** 键，亦可快速同步最新主机列表。
 
 ## MCP
 
