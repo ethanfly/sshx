@@ -120,11 +120,25 @@ export async function runSyncSetup(options: {
     }
   } else {
     let token = options.token || (await prompt(`GitHub Personal Access Token: `, true));
-    let gistId = options.gistId || (await prompt(`Existing Gist ID (leave blank to auto-create): `));
+    let rawGistId = options.gistId || (await prompt(`Existing Gist ID (leave blank to auto-create, or paste 32-char hex ID): `));
+
+    let sanitizedGistId: string | undefined = undefined;
+    const cleanGist = rawGistId.trim();
+    if (cleanGist) {
+      // Handle full URL: https://gist.github.com/user/a1b2c3d4...
+      const urlMatch = cleanGist.match(/gist\.github\.com\/[^/]+\/([0-9a-fA-F]+)/);
+      if (urlMatch) {
+        sanitizedGistId = urlMatch[1];
+      } else if (/^[0-9a-fA-F]{20,32}$/.test(cleanGist) || /^\d+$/.test(cleanGist)) {
+        sanitizedGistId = cleanGist;
+      } else {
+        process.stdout.write(`${colors.yellow}Note: "${cleanGist}" is not a valid Gist ID. Leaving blank to auto-create on push.${colors.reset}\n`);
+      }
+    }
 
     syncConfig.gist = {
       token: token.trim(),
-      gistId: gistId.trim() || undefined
+      gistId: sanitizedGistId
     };
 
     process.stdout.write(`\nTesting GitHub connection... `);

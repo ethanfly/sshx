@@ -145,6 +145,26 @@ export class GistProvider implements SyncProvider {
 
       if (res.status === 200) {
         const user = await res.json() as { login?: string };
+        const scopes = res.headers.get('x-oauth-scopes');
+        if (scopes !== null && !scopes.split(',').map(s => s.trim()).includes('gist')) {
+          return {
+            ok: false,
+            message: `Authenticated as @${user.login || 'user'}, but token is missing the required 'gist' scope.`
+          };
+        }
+
+        if (this.config.gistId) {
+          const gistRes = await fetch(`https://api.github.com/gists/${this.config.gistId}`, {
+            headers: this.headers
+          });
+          if (gistRes.status === 404) {
+            return {
+              ok: true,
+              message: `Authenticated as @${user.login || 'user'} (Note: specified Gist ID '${this.config.gistId}' not found; a new secret Gist will be auto-created on first push)`
+            };
+          }
+        }
+
         return { ok: true, message: `Authenticated as GitHub user @${user.login || 'user'}` };
       }
 
@@ -170,9 +190,21 @@ export class GistProvider implements SyncProvider {
       this.config.gistId = gistId;
     }
 
-    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+    let res = await fetch(`https://api.github.com/gists/${gistId}`, {
       headers: this.headers
     });
+
+    if (res.status === 404) {
+      // If configured gistId was not found, attempt to find by filename
+      const autoFound = await this.findSshxGistId();
+      if (autoFound && autoFound !== gistId) {
+        gistId = autoFound;
+        this.config.gistId = gistId;
+        res = await fetch(`https://api.github.com/gists/${gistId}`, {
+          headers: this.headers
+        });
+      }
+    }
 
     if (res.status === 404) {
       throw new Error(`Gist ${gistId} not found. Please verify your gistId or push again.`);
@@ -213,34 +245,55 @@ export class GistProvider implements SyncProvider {
         })
       });
 
-      if (!res.ok) {
-        throw new Error(`Failed to update Gist ${gistId} (${res.status} ${res.statusText})`);
+      if (res.ok) {
+        this.config.gistId = gistId;
+        return { remoteId: gistId };
       }
 
-      this.config.gistId = gistId;
-      return { remoteId: gistId };
-    } else {
-      // Create new secret Gist
-      const res = await fetch('https://api.github.com/gists', {
-        method: 'POST',
-        headers: this.headers,
-        body: JSON.stringify({
-          description,
-          public: false,
-          files: {
-            [GistProvider.GIST_FILENAME]: { content: encryptedBlob }
-          }
-        })
-      });
-
-      if (!res.ok) {
-        throw new Error(`Failed to create secret Gist (${res.status} ${res.statusText})`);
+      if (res.status === 404) {
+        // Gist was not found (invalid ID or deleted). Auto-fallback to create a new secret Gist below.
+        gistId = undefined;
+      } else {
+        let msg = `${res.status} ${res.statusText}`;
+        try {
+          const errData = await res.json() as any;
+          if (errData?.message) msg += `: ${errData.message}`;
+        } catch {}
+        if (res.status === 403) {
+          throw new Error(`GitHub token lacks Gist write permission (${msg}). Please ensure your token has 'gist' (Classic) or Account -> Gists write access (Fine-grained).`);
+        }
+        throw new Error(`Failed to update Gist ${gistId} (${msg})`);
       }
-
-      const created = await res.json() as any;
-      this.config.gistId = created.id;
-      return { remoteId: created.id };
     }
+
+    // Create new secret Gist
+    const res = await fetch('https://api.github.com/gists', {
+      method: 'POST',
+      headers: this.headers,
+      body: JSON.stringify({
+        description,
+        public: false,
+        files: {
+          [GistProvider.GIST_FILENAME]: { content: encryptedBlob }
+        }
+      })
+    });
+
+    if (!res.ok) {
+      let msg = `${res.status} ${res.statusText}`;
+      try {
+        const errData = await res.json() as any;
+        if (errData?.message) msg += `: ${errData.message}`;
+      } catch {}
+      if (res.status === 403) {
+        throw new Error(`GitHub token lacks Gist write permission (${msg}). Please ensure your token has 'gist' (Classic) or Account -> Gists write access (Fine-grained).`);
+      }
+      throw new Error(`Failed to create secret Gist (${msg})`);
+    }
+
+    const created = await res.json() as any;
+    this.config.gistId = created.id;
+    return { remoteId: created.id };
   }
 
   private async findSshxGistId(): Promise<string | undefined> {
