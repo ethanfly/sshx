@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import { Command } from 'commander';
 import { runConnect } from './connect.js';
 import { runExec } from './exec.js';
@@ -20,13 +21,23 @@ import { startTUI, TuiOptions } from '../tui/index.js';
 import { startMcpServer } from '../skill/mcp-server.js';
 import { runSkillCli } from '../skill/runner.js';
 
+function getVersion(): string {
+  try {
+    const require = createRequire(import.meta.url);
+    const pkg = require('../../package.json');
+    return pkg.version || '1.1.0';
+  } catch {
+    return '1.1.0';
+  }
+}
+
 export function createCli(): Command {
   const program = new Command();
 
   program
     .name('sshx')
     .description('Cross-platform SSH client with TUI launcher, CLI, and MCP host management')
-    .version('1.0.0');
+    .version(getVersion());
 
   // Direct connect fallback: sshx [target] or default to TUI
   program
