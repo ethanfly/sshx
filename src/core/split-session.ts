@@ -24,6 +24,7 @@ export class SplitSession {
   private sidebarWidth: number;
   private lastMetrics?: ServerMetrics;
   private isDestroyed = false;
+  private enteredAltScreen = false;
 
   constructor(client: Client, options: SplitSessionOptions = {}) {
     this.client = client;
@@ -89,9 +90,12 @@ export class SplitSession {
     const totalCols = stdout.columns || 80;
     const totalRows = stdout.rows || 24;
 
-    if (this.sidebarVisible) {
-      this.enableTerminalMargins();
+    if (this.sidebarVisible && stdout.isTTY) {
+      // Enter alternate screen buffer & clear to prevent previous terminal scrollback from showing
+      stdout.write('\x1b[?1049h\x1b[2J\x1b[H');
+      this.enteredAltScreen = true;
       this.drawSidebar();
+      this.enableTerminalMargins();
     }
 
     // Set raw mode
@@ -115,8 +119,8 @@ export class SplitSession {
       this.session.resize(leftCols, rows);
 
       if (this.sidebarVisible) {
-        this.enableTerminalMargins();
         this.drawSidebar();
+        this.enableTerminalMargins();
       } else {
         this.disableTerminalMargins();
       }
@@ -154,6 +158,12 @@ export class SplitSession {
       }
       this.disableTerminalMargins();
 
+      if (this.enteredAltScreen && stdout.isTTY) {
+        // Exit alternate screen buffer, cleanly restoring user's original terminal
+        stdout.write('\x1b[?1049l');
+        this.enteredAltScreen = false;
+      }
+
       if (stdin.isTTY) {
         stdin.setRawMode(false);
         stdin.pause();
@@ -177,9 +187,15 @@ export class SplitSession {
       }
       this.sidebarVisible = true;
       const leftCols = this.computeShellCols(totalCols);
+
+      if (!this.enteredAltScreen && stdout.isTTY) {
+        stdout.write('\x1b[?1049h');
+        this.enteredAltScreen = true;
+      }
+      stdout.write('\x1b[2J\x1b[H');
+      this.drawSidebar();
       this.enableTerminalMargins();
       this.session.resize(leftCols, totalRows);
-      this.drawSidebar();
     } else {
       this.sidebarVisible = false;
       this.disableTerminalMargins();
@@ -192,9 +208,10 @@ export class SplitSession {
   private enableTerminalMargins(): void {
     if (!process.stdout.isTTY) return;
     const totalCols = process.stdout.columns || 80;
+    const totalRows = process.stdout.rows || 24;
     const leftCols = this.computeShellCols(totalCols);
-    // DECLRMM enable (\x1b[?69h), set margins (\x1b[1;{leftCols}s)
-    process.stdout.write(`\x1b[?69h\x1b[1;${leftCols}s`);
+    // DECLRMM enable (\x1b[?69h), set vertical margin (\x1b[1;{totalRows}r), set horizontal margin (\x1b[1;{leftCols}s)
+    process.stdout.write(`\x1b[?69h\x1b[1;${totalRows}r\x1b[1;${leftCols}s`);
   }
 
   private disableTerminalMargins(): void {
@@ -225,8 +242,10 @@ export class SplitSession {
     );
 
     let buf = '';
-    // Save cursor: \x1b7 (DECSC) or \x1b[s
-    buf += '\x1b7\x1b[?25l'; // save cursor & hide cursor while drawing sidebar
+    // 1. Save cursor & hide cursor while updating sidebar
+    buf += '\x1b7\x1b[?25l';
+    // 2. Temporarily disable horizontal margin so cursor can move outside leftCols
+    buf += '\x1b[?69l';
 
     for (let r = 1; r <= Math.min(lines.length, totalRows); r++) {
       const line = lines[r - 1];
@@ -234,8 +253,11 @@ export class SplitSession {
       buf += `\x1b[${r};${sideStartCol}H${line}`;
     }
 
-    // Restore cursor: \x1b8 (DECRC) & show cursor
+    // 3. Re-enable horizontal margin for shell
+    buf += `\x1b[?69h\x1b[1;${totalRows}r\x1b[1;${leftCols}s`;
+    // 4. Restore cursor & show cursor
     buf += '\x1b8\x1b[?25h';
+
     stdout.write(buf);
   }
 }
