@@ -1,3 +1,26 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo.svg">
+    <img src="assets/logo.svg" alt="sshx - Modern SSH Host Manager" width="780">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/@ethanfly/sshx"><img src="https://img.shields.io/npm/v/@ethanfly/sshx?color=22d3ee&labelColor=0f172a&logo=npm" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/@ethanfly/sshx"><img src="https://img.shields.io/npm/dm/@ethanfly/sshx?color=818cf8&labelColor=0f172a" alt="npm downloads"></a>
+  <a href="https://github.com/ethanfly/sshx/actions"><img src="https://img.shields.io/github/actions/workflow/status/ethanfly/sshx/build.yml?branch=master&color=34d399&labelColor=0f172a&label=build" alt="build status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-e879f9?labelColor=0f172a" alt="license"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D20-67e8f9?labelColor=0f172a&logo=node.js&logoColor=67e8f9" alt="node version"></a>
+</p>
+
+<p align="center">
+  <b>现代化跨平台 SSH 客户端与主机管理工具</b><br>
+  终端交互 TUI · 快速命令行 CLI · AI Agent 原生 MCP 协议支持
+</p>
+
+---
+
 # sshx
 
 跨平台 SSH 客户端。TypeScript + Node.js 实现，提供三种用法：
