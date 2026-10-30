@@ -306,6 +306,10 @@ sshx sync setup
 - **WebDAV**：坚果云、Nextcloud、ownCloud、群晖 NAS、Alist 等
 - **GitHub Gist**：使用 Personal Access Token 自动创建/更新私有密文 Gist
 
+> **GitHub Gist 提示**：
+> - **Token 权限**：建议使用 GitHub [Classic Personal Access Token](https://github.com/settings/tokens/new) 并勾选 **`gist`** 权限（Create gists）。
+> - **Gist ID 说明**：在交互向导中，`Existing Gist ID` **直接回车留空**即可，`sshx sync push` 会自动在您的 GitHub 上创建名为 `sshx-hosts.enc` 的私密 Gist；若需连接已有设备创建的备份，输入 32 位十六进制 Gist ID 或粘贴完整 Gist 网页链接均可（系统会自动提取并容错）。
+
 也支持直接通过命令行参数快速配置：
 
 ```bash
