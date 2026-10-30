@@ -246,6 +246,8 @@ export class SplitSession {
     buf += '\x1b7\x1b[?25l';
     // 2. Temporarily disable horizontal margin so cursor can move outside leftCols
     buf += '\x1b[?69l';
+    // 3. Temporarily disable auto-wrap mode (DECAWM) to guarantee zero wrap-around to column 1
+    buf += '\x1b[?7l';
 
     for (let r = 1; r <= Math.min(lines.length, totalRows); r++) {
       const line = lines[r - 1];
@@ -253,9 +255,11 @@ export class SplitSession {
       buf += `\x1b[${r};${sideStartCol}H${line}`;
     }
 
-    // 3. Re-enable horizontal margin for shell
+    // 4. Re-enable auto-wrap mode for shell
+    buf += '\x1b[?7h';
+    // 5. Re-enable horizontal margin for shell
     buf += `\x1b[?69h\x1b[1;${totalRows}r\x1b[1;${leftCols}s`;
-    // 4. Restore cursor & show cursor
+    // 6. Restore cursor & show cursor
     buf += '\x1b8\x1b[?25h';
 
     stdout.write(buf);

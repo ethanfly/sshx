@@ -41,7 +41,11 @@ export class SidebarRenderer {
       }
       const titleClean = ` ${title} `;
       const titleLen = stringWidth(titleClean);
-      const remaining = Math.max(0, borderFillW - titleLen);
+      if (titleLen >= borderFillW) {
+        const clipped = padClip(titleClean, borderFillW);
+        return `${theme.border}├${theme.title}${clipped}${theme.border}┤${theme.reset}`;
+      }
+      const remaining = borderFillW - titleLen;
       const left = Math.min(1, remaining);
       const right = remaining - left;
       return `${theme.border}├${'─'.repeat(left)}${theme.title}${titleClean}${theme.border}${'─'.repeat(right)}┤${theme.reset}`;

@@ -96,9 +96,9 @@ test('SidebarRenderer: formats sidebar lines within width constraints', () => {
 
   assert.strictEqual(lines.length, height);
   for (const line of lines) {
-    // Strip ANSI codes and verify display width is <= width
+    // Strip ANSI codes and verify display width is exactly width
     const clean = line.replace(/\x1b\[[0-9;]*m/g, '');
     const w = stringWidth(clean);
-    assert.ok(w <= width, `Line display width (${w}) exceeds max width (${width}): "${clean}"`);
+    assert.strictEqual(w, width, `Line display width (${w}) must be exactly width (${width}): "${clean}"`);
   }
 });

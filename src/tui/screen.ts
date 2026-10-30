@@ -87,8 +87,14 @@ export function stripAnsi(str: string): string {
 
 export function charWidth(code: number): number {
   if (code < 0x20 || (code >= 0x7f && code < 0xa0)) return 0;
-  // Combining marks
-  if (code >= 0x0300 && code <= 0x036f) return 0;
+  // Combining marks & variation selectors (e.g. VS15, VS16)
+  if (
+    (code >= 0x0300 && code <= 0x036f) ||
+    (code >= 0xfe00 && code <= 0xfe0f) ||
+    (code >= 0xe0100 && code <= 0xe01ef)
+  ) {
+    return 0;
+  }
   // CJK and fullwidth ranges
   if (
     (code >= 0x1100 && code <= 0x115f) || // Hangul Jamo
@@ -99,7 +105,14 @@ export function charWidth(code: number): number {
     (code >= 0xfe30 && code <= 0xfe6f) || // CJK Compatibility Forms
     (code >= 0xff00 && code <= 0xff60) || // Fullwidth Forms
     (code >= 0xffe0 && code <= 0xffe6) || // Fullwidth punctuation & currency
-    (code >= 0x20000 && code <= 0x323af)  // CJK Extension B-G
+    (code >= 0x20000 && code <= 0x323af) || // CJK Extension B-G
+    // Emojis & Pictographs (SMP Plane 1)
+    (code >= 0x1f300 && code <= 0x1faff) || // Misc Symbols & Pictographs, Emoticons, Supplemental, Ext-A
+    (code >= 0x1f100 && code <= 0x1f2ff) || // Enclosed Alphanumeric & CJK
+    // BMP Emojis & Miscellaneous Symbols that modern terminals render as 2 cells
+    (code >= 0x2600 && code <= 0x26ff) || // Misc symbols (⚡ 0x26a1, ⚠ 0x26a0, ☕, etc.)
+    (code >= 0x2b50 && code <= 0x2b55) || // Stars, circles
+    (code >= 0x231a && code <= 0x23f3)    // Watch, hourglass
   ) {
     return 2;
   }
