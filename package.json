@@ -1,35 +1,42 @@
 {
-  "name": "sshx",
+  "name": "@ethanfly/sshx",
   "version": "1.0.0",
   "description": "Cross-platform SSH client featuring TUI, CLI, and MCP host management",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "sshx": "./bin/sshx.js"
+    "sshx": "bin/sshx.js"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ethanfly/sshx.git"
+  },
+  "homepage": "https://github.com/ethanfly/sshx#readme",
+  "bugs": {
+    "url": "https://github.com/ethanfly/sshx/issues"
+  },
+  "author": "EthanFeng <fycookie@gmail.com>",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "tsc",
     "build:all": "bash scripts/build.sh",
+    "prepublishOnly": "npm run build && npm test",
     "start": "tsx src/cli/index.ts",
     "dev:cli": "tsx src/cli/index.ts",
     "dev:tui": "tsx src/cli/index.ts tui",
     "dev:mcp": "tsx src/cli/index.ts mcp",
     "test": "npm run build && node --test test/core.test.ts test/tunnel.test.ts test/cli.test.ts test/mcp.test.ts --import tsx"
   },
-  "keywords": [
-    "ssh",
-    "ssh-client",
-    "sftp",
-    "tunnel",
-    "terminal",
-    "tui",
-    "mcp",
-    "claude-skill",
-    "cross-platform"
-  ],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "commander": "^15.0.0",

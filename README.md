@@ -26,7 +26,34 @@
 
 ## 安装
 
-### 从源码安装（推荐）
+### 通过 npm 全局安装（推荐）
+
+```bash
+npm install -g @ethanfly/sshx
+```
+
+使用 pnpm 或 yarn 安装：
+
+```bash
+pnpm add -g @ethanfly/sshx
+# 或
+yarn global add @ethanfly/sshx
+```
+
+安装完成后，在终端直接输入 `sshx` 即可默认进入 TUI 启动器：
+
+```bash
+sshx --help
+sshx
+```
+
+### 免安装直接体验
+
+```bash
+npx @ethanfly/sshx
+```
+
+### 从源码安装
 
 ```bash
 git clone https://github.com/ethanfly/sshx.git
@@ -195,7 +222,7 @@ sshx tui --sort fancy
 
 ## MCP
 
-在 Claude Code 里登记：
+在 Claude Code 或支持 MCP 的客户端中登记：
 
 ```json
 {
@@ -208,7 +235,18 @@ sshx tui --sort fancy
 }
 ```
 
-还没全局安装时，把 `command` 写成 `node`，`args` 写成 `sshx` 仓库里 `bin/sshx.js` 的绝对路径再加上 `mcp`。
+免全局安装也可以直接用 `npx`：
+
+```json
+{
+  "mcpServers": {
+    "sshx": {
+      "command": "npx",
+      "args": ["-y", "@ethanfly/sshx", "mcp"]
+    }
+  }
+}
+```
 
 工具：
 
