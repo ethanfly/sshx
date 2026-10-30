@@ -17,6 +17,7 @@ import {
 } from '../dist/index.js';
 import { stringWidth, padClip } from '../dist/tui/screen.js';
 import { TuiApp } from '../dist/tui/app.js';
+import { computeTableLayout } from '../dist/tui/screens/hosts.js';
 import { MockSSHServer } from './mock-server.ts';
 
 let mockServer: MockSSHServer;
@@ -327,4 +328,64 @@ test('TuiApp: suspend and resume lifecycle restores stdin flowing state and raw 
   // Restore paused state so node test runner does not wait for stdin
   process.stdin.pause();
 });
+
+test('computeTableLayout: eliminates center gap and sizes columns proportionally', () => {
+  const sampleHosts = [
+    {
+      id: '1',
+      name: '66云美国',
+      host: '216.167.54.250',
+      port: 22,
+      username: 'root',
+      authType: 'privateKey' as const,
+      privateKeyPath: '~/.ssh/id_ed25519',
+      notes: 'Debian GNU/Linux 12 (bookworm)'
+    },
+    {
+      id: '2',
+      name: '美国vps家宽',
+      host: '216.167.74.174',
+      port: 38566,
+      username: 'root',
+      authType: 'privateKey' as const,
+      privateKeyPath: '~/.ssh/keys/us-vps-home.key',
+      tags: ['生产', 'vps'],
+      notes: 'CentOS Stream 9'
+    },
+    {
+      id: '3',
+      name: 'HQT本地Git运维',
+      host: '192.168.100.72',
+      port: 22,
+      username: 'root',
+      authType: 'privateKey' as const,
+      tags: ['红蜻蜓', '本地', 'git', '运维'],
+      notes: 'Debian 12'
+    }
+  ];
+
+  // Wide terminal (220 cols, like user's screen in Image #2)
+  const wide = computeTableLayout(220, sampleHosts);
+  // DEST column must NOT absorb 100+ chars
+  assert.ok(wide.dest <= 32, `dest width should be reasonably bounded, got ${wide.dest}`);
+  assert.ok(wide.dest >= 26, `dest width should comfortably fit content, got ${wide.dest}`);
+  // AUTH column should fit 'key:us-vps-home.key' (20 chars) without truncation
+  assert.ok(wide.auth >= 20, `auth width should fit key name, got ${wide.auth}`);
+  // TAGS column should fit content
+  assert.ok(wide.tags >= 18, `tags width should fit tags, got ${wide.tags}`);
+  // NOTES column should be activated on wide screens
+  assert.ok(wide.notes !== undefined && wide.notes >= 20, `notes column should be active on wide screen, got ${wide.notes}`);
+  assert.equal(wide.gap, 2);
+
+  // Normal terminal (100 cols)
+  const normal = computeTableLayout(100, sampleHosts);
+  assert.ok(normal.dest <= 32);
+  assert.ok(normal.totalWidth <= 100);
+
+  // Narrow terminal (60 cols)
+  const narrow = computeTableLayout(60, sampleHosts);
+  assert.ok(narrow.totalWidth <= 60, `narrow totalWidth (${narrow.totalWidth}) should fit in 60 cols`);
+  assert.equal(narrow.gap, 1);
+});
+
 

@@ -1,6 +1,6 @@
 import { defaultConfigManager, HostProfile } from '../../core/config.js';
 import { SSHConnection } from '../../core/client.js';
-import { ScreenBuffer, padClip } from '../screen.js';
+import { ScreenBuffer, padClip, stringWidth } from '../screen.js';
 import { TuiTheme } from '../theme.js';
 import { colors } from '../../cli/utils.js';
 
@@ -125,15 +125,23 @@ export class HostsScreen {
     const right = `${theme.muted}${this.sortMode}  ${count}${colors.reset}`;
     screen.writeAt(Math.max(1, screen.cols - count.length - this.sortMode.length - 4), 1, right);
 
-    const cols = columnWidths(screen.cols);
-    const header =
-      `${theme.muted}` +
-      padClip('NAME', cols.name) + ' ' +
-      padClip('DESTINATION', cols.dest) + ' ' +
-      padClip('AUTH', cols.auth) + ' ' +
-      padClip('TAGS', cols.tags) + ' ' +
-      padClip('LAST', cols.last) +
-      colors.reset;
+    const layout = computeTableLayout(screen.cols, this.hosts.length > 0 ? this.hosts : list);
+    const sep = ' '.repeat(layout.gap);
+
+    const headerParts: string[] = [
+      padClip('NAME', layout.name),
+      padClip('DESTINATION', layout.dest),
+      padClip('AUTH', layout.auth)
+    ];
+    if (layout.tags > 0) {
+      headerParts.push(padClip('TAGS', layout.tags));
+    }
+    if (layout.notes !== undefined) {
+      headerParts.push(padClip('NOTES', layout.notes));
+    }
+    headerParts.push(padClip('LAST', layout.last));
+
+    const header = `${theme.muted}${headerParts.join(sep)}${colors.reset}`;
     screen.writeAt(2, headerRow, header);
 
     if (list.length === 0) {
@@ -155,12 +163,22 @@ export class HostsScreen {
           : host.lastConnected
             ? new Date(host.lastConnected).toLocaleDateString()
             : '-';
-        const line =
-          padClip(host.name, cols.name) + ' ' +
-          padClip(dest, cols.dest) + ' ' +
-          padClip(auth, cols.auth) + ' ' +
-          padClip(tags, cols.tags) + ' ' +
-          padClip(last, cols.last);
+
+        const lineParts: string[] = [
+          padClip(host.name, layout.name),
+          padClip(dest, layout.dest),
+          padClip(auth, layout.auth)
+        ];
+        if (layout.tags > 0) {
+          lineParts.push(padClip(tags, layout.tags));
+        }
+        if (layout.notes !== undefined) {
+          const noteText = host.notes || (host.proxyJump ? `via ${host.proxyJump}` : '');
+          lineParts.push(padClip(noteText, layout.notes));
+        }
+        lineParts.push(padClip(last, layout.last));
+
+        const line = lineParts.join(sep);
         const row = listTop + i;
         if (selected) {
           const selectedWidth = Math.max(10, screen.cols - 1);
@@ -203,12 +221,86 @@ function authLabel(host: HostProfile): string {
   return host.authType || 'key';
 }
 
-function columnWidths(cols: number): { name: number; dest: number; auth: number; tags: number; last: number } {
-  const usable = Math.max(40, cols - 6);
-  const last = 12;
-  const auth = Math.min(18, Math.floor(usable * 0.16));
-  const tags = Math.min(18, Math.floor(usable * 0.16));
-  const name = Math.min(22, Math.floor(usable * 0.22));
-  const dest = Math.max(16, usable - last - auth - tags - name);
-  return { name, dest, auth, tags, last };
+export interface TableLayout {
+  name: number;
+  dest: number;
+  auth: number;
+  tags: number;
+  notes?: number;
+  last: number;
+  gap: number;
+  totalWidth: number;
+}
+
+export function computeTableLayout(screenCols: number, hosts: HostProfile[]): TableLayout {
+  const usable = Math.max(30, screenCols - 4);
+
+  let maxName = 4; // 'NAME'
+  let maxDest = 11; // 'DESTINATION'
+  let maxAuth = 4; // 'AUTH'
+  let maxTags = 4; // 'TAGS'
+  let maxNotes = 5; // 'NOTES'
+  let hasNotes = false;
+
+  for (const h of hosts) {
+    const nw = stringWidth(h.name);
+    if (nw > maxName) maxName = nw;
+
+    const dw = stringWidth(`${h.username}@${h.host}:${h.port}`);
+    if (dw > maxDest) maxDest = dw;
+
+    const aw = stringWidth(authLabel(h));
+    if (aw > maxAuth) maxAuth = aw;
+
+    const tw = stringWidth((h.favorite ? '★ ' : '') + (h.tags || []).join(','));
+    if (tw > maxTags) maxTags = tw;
+
+    const noteText = h.notes || (h.proxyJump ? `via ${h.proxyJump}` : '');
+    if (noteText && noteText.trim()) {
+      hasNotes = true;
+      const noteW = stringWidth(noteText.trim());
+      if (noteW > maxNotes) maxNotes = noteW;
+    }
+  }
+
+  // Base sizing based on content with breathing room
+  let name = Math.max(14, Math.min(26, maxName + 1));
+  let dest = Math.max(20, Math.min(32, maxDest + 1));
+  let auth = Math.max(12, Math.min(22, maxAuth + 1));
+  let tags = Math.max(10, Math.min(28, maxTags + 1));
+  let last = 12;
+  let gap = usable >= 70 ? 2 : 1;
+
+  // Check if wide screen can fit NOTES column
+  const baseWithoutNotes = name + dest + auth + tags + last + 4 * gap;
+  let notes: number | undefined = undefined;
+
+  if (hasNotes && usable >= 110 && usable >= baseWithoutNotes + 14 + gap) {
+    const availableForNotes = usable - baseWithoutNotes - gap;
+    notes = Math.max(12, Math.min(Math.min(34, maxNotes + 1), availableForNotes));
+  }
+
+  let totalWidth = name + dest + auth + tags + (notes !== undefined ? notes + gap : 0) + last + 4 * gap;
+
+  // On tight screens, gracefully compress or drop columns
+  if (totalWidth > usable) {
+    gap = 1;
+    totalWidth = name + dest + auth + tags + (notes !== undefined ? notes + gap : 0) + last + 4 * gap;
+    if (totalWidth > usable && notes !== undefined) {
+      notes = undefined;
+      totalWidth = name + dest + auth + tags + last + 4 * gap;
+    }
+    if (totalWidth > usable && usable < 65) {
+      tags = 0;
+      totalWidth = name + dest + auth + last + 3 * gap;
+    }
+    if (totalWidth > usable) {
+      const excess = totalWidth - usable;
+      dest = Math.max(14, dest - Math.ceil(excess * 0.6));
+      name = Math.max(10, name - Math.floor(excess * 0.4));
+      totalWidth = name + dest + auth + (tags > 0 ? tags + gap : 0) + last + (tags > 0 ? 4 : 3) * gap;
+    }
+  }
+
+  return { name, dest, auth, tags, notes, last, gap, totalWidth };
 }
