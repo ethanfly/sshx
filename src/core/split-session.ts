@@ -109,20 +109,25 @@ export class SplitSession {
       const cols = stdout.columns || 80;
       const rows = stdout.rows || 24;
 
+      if (this.sidebarVisible && this.enteredAltScreen) {
+        // Repaint from scratch: the sidebar is drawn at absolute coordinates,
+        // so the stale copy survives a resize. DECLRMM margins would confine
+        // the erase to the shell pane, so drop margins before clearing.
+        this.disableTerminalMargins();
+        stdout.write('\x1b[2J\x1b[H');
+      }
+
       if (this.sidebarVisible && cols < 85) {
         // Automatically hide sidebar on narrow terminals
         this.sidebarVisible = false;
-        this.disableTerminalMargins();
       }
 
       const leftCols = this.computeShellCols(cols);
       this.session.resize(leftCols, rows);
 
       if (this.sidebarVisible) {
-        this.drawSidebar();
         this.enableTerminalMargins();
-      } else {
-        this.disableTerminalMargins();
+        this.drawSidebar();
       }
     };
 
