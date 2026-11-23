@@ -51,18 +51,26 @@ test('CLI: --help prints available subcommands', async () => {
   assert.ok(res.stdout.includes('skill'));
 });
 
-test('CLI: keygen generates Ed25519 key file', async () => {
-  const tmpKey = path.join(os.tmpdir(), `sshx_test_key_${Date.now()}`);
-  const res = await runCli(['keygen', '-t', 'ed25519', '-f', tmpKey, '-N', '', '-C', 'test@ci']);
-  assert.equal(res.code, 0);
-  assert.ok(fs.existsSync(tmpKey));
-  assert.ok(fs.existsSync(`${tmpKey}.pub`));
+test('CLI: keygen generates an Ed25519 key and refuses to overwrite it', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-cli-key-'));
+  const keyPath = path.join(tempDir, 'id_ed25519');
+  try {
+    const args = ['keygen', '-t', 'ed25519', '-f', keyPath, '-N', '', '-C', 'test-key'];
+    const result = await runCli(args);
+    assert.equal(result.code, 0);
+    const privateKey = fs.readFileSync(keyPath, 'utf8');
+    const publicKey = fs.readFileSync(`${keyPath}.pub`, 'utf8');
+    assert.match(privateKey, /BEGIN OPENSSH PRIVATE KEY/);
+    assert.match(publicKey, /^ssh-ed25519 /);
 
-  const pubContent = fs.readFileSync(`${tmpKey}.pub`, 'utf8');
-  assert.ok(pubContent.startsWith('ssh-ed25519 '));
-
-  fs.unlinkSync(tmpKey);
-  fs.unlinkSync(`${tmpKey}.pub`);
+    const collision = await runCli(args);
+    assert.equal(collision.code, 1);
+    assert.match(collision.stderr, /Key file already exists/);
+    assert.equal(fs.readFileSync(keyPath, 'utf8'), privateKey);
+    assert.equal(fs.readFileSync(`${keyPath}.pub`, 'utf8'), publicKey);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('CLI: exec command against mock SSH server with --json', async () => {
@@ -246,6 +254,54 @@ test('CLI: host aliases (new, ls, info, rm, delete) and error suggestions', asyn
   const delRes = await runCli(['host', 'delete', aliasHost, '-y']);
   assert.equal(delRes.code, 0);
   assert.ok(delRes.stdout.includes('Removed host profile'));
+});
+
+test('CLI: host add requires explicit overwrite and honors authentication aliases', async () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-cli-overwrite-'));
+  const env = { SSHX_CONFIG_DIR: temporary };
+  try {
+    const add = await runCli([
+      'host', 'add', '--name', 'Primary', '--host', '192.0.2.1', '--username', 'alice',
+      '--port', '2222', '--auth', 'key', '--key', '~/.ssh/test-key', '--jump', 'bastion',
+      '--notes', 'preserved notes', '--tags', 'test'
+    ], env);
+    assert.equal(add.code, 0, add.stderr);
+    const hostsFile = path.join(temporary, 'hosts.json');
+    const before = fs.readFileSync(hostsFile, 'utf8');
+    const [initial] = JSON.parse(before);
+    assert.equal(initial.authType, 'privateKey');
+    assert.equal(initial.privateKeyPath, '~/.ssh/test-key');
+    assert.equal(initial.proxyJump, 'bastion');
+
+    const duplicate = await runCli(['host', 'add', '--name', 'PRIMARY', '--host', '192.0.2.2', '--yes'], env);
+    assert.equal(duplicate.code, 1);
+    assert.match(duplicate.stderr, /already exists.*--force/);
+    assert.equal(fs.readFileSync(hostsFile, 'utf8'), before);
+
+    const forced = await runCli(['host', 'add', '--name', 'PRIMARY', '--host', '192.0.2.1', '--force'], env);
+    assert.equal(forced.code, 0, forced.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(hostsFile, 'utf8')), [{ ...initial, name: 'PRIMARY' }]);
+
+    const replacement = await runCli(['host', 'add', '--name', 'PRIMARY', '--host', '192.0.2.2', '--force'], env);
+    assert.equal(replacement.code, 0, replacement.stderr);
+    const [replaced] = JSON.parse(fs.readFileSync(hostsFile, 'utf8'));
+    assert.equal(replaced.id, initial.id);
+    assert.equal(replaced.host, '192.0.2.2');
+    assert.equal(replaced.notes, initial.notes);
+    assert.deepEqual(replaced.tags, initial.tags);
+    assert.equal(replaced.authType, 'password');
+    assert.equal(replaced.privateKeyPath, undefined);
+    assert.equal(replaced.proxyJump, undefined);
+
+    const renamed = await runCli(['host', 'edit', 'primary', '--auth-type', 'key', '--key', '~/.ssh/other-key'], env);
+    assert.equal(renamed.code, 0, renamed.stderr);
+    const [edited] = JSON.parse(fs.readFileSync(hostsFile, 'utf8'));
+    assert.equal(edited.id, initial.id);
+    assert.equal(edited.authType, 'privateKey');
+    assert.equal(edited.privateKeyPath, '~/.ssh/other-key');
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
 });
 
 test('CLI: running bare sshx defaults to TUI', async () => {

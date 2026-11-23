@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import ssh2 from 'ssh2';
 
 export interface KeyPairResult {
   publicKeyOpenSSH: string;
@@ -40,28 +41,16 @@ export class KeyManager {
     const comment = options.comment || `${os.userInfo().username}@${os.hostname()}`;
 
     if (keyType === 'ed25519') {
-      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519', {
-        publicKeyEncoding: {
-          type: 'spki',
-          format: 'der'
-        },
-        privateKeyEncoding: {
-          type: 'pkcs8',
-          format: 'pem',
-          cipher: options.passphrase ? 'aes-256-cbc' : undefined,
-          passphrase: options.passphrase
-        }
+      const pair = ssh2.utils.generateKeyPairSync('ed25519', {
+        comment,
+        ...(options.passphrase ? { passphrase: options.passphrase, cipher: 'aes256-ctr', rounds: 16 } : {})
       });
-
-      // Extract raw 32 bytes ed25519 public key from SPKI DER (last 32 bytes)
-      const rawPub = publicKey.subarray(publicKey.length - 32);
-      const wireBuffer = encodeSshWire(['ssh-ed25519', rawPub]);
-      const publicKeyOpenSSH = `ssh-ed25519 ${wireBuffer.toString('base64')} ${comment}`.trim();
+      const wireBuffer = Buffer.from(pair.public.split(' ', 2)[1], 'base64');
       const fingerprintSha256 = `SHA256:${crypto.createHash('sha256').update(wireBuffer).digest('base64').replace(/=+$/, '')}`;
 
       return {
-        publicKeyOpenSSH,
-        privateKeyPem: privateKey,
+        publicKeyOpenSSH: pair.public,
+        privateKeyPem: pair.private,
         fingerprintSha256,
         keyType: 'ed25519'
       };
@@ -113,13 +102,30 @@ export class KeyManager {
     const resolvedPath = path.resolve(outputFilePath);
     const pubPath = `${resolvedPath}.pub`;
 
-    const dir = path.dirname(resolvedPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    }
+    fs.mkdirSync(path.dirname(resolvedPath), { recursive: true, mode: 0o700 });
 
-    fs.writeFileSync(resolvedPath, result.privateKeyPem, { mode: 0o600 });
-    fs.writeFileSync(pubPath, `${result.publicKeyOpenSSH}\n`, { mode: 0o644 });
+    const createdPaths: string[] = [];
+    const writeNewFile = (filePath: string, content: string, mode: number) => {
+      const fd = fs.openSync(filePath, 'wx', mode);
+      createdPaths.push(filePath);
+      try {
+        fs.writeFileSync(fd, content);
+      } finally {
+        fs.closeSync(fd);
+      }
+    };
+
+    try {
+      writeNewFile(resolvedPath, result.privateKeyPem, 0o600);
+      writeNewFile(pubPath, `${result.publicKeyOpenSSH}\n`, 0o644);
+    } catch (err) {
+      for (const filePath of createdPaths) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch {}
+      }
+      throw err;
+    }
 
     return {
       privateKeyPath: resolvedPath,

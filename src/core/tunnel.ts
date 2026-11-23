@@ -452,25 +452,15 @@ export function parsePortForwardString(spec: string, type: 'local' | 'remote' | 
 
   // Format: [bind_address:]port:host:hostport
   const parts = spec.split(':');
-  if (parts.length === 3) {
-    return {
-      id,
-      type,
-      localHost: '127.0.0.1',
-      localPort: parseInt(parts[0], 10),
-      remoteHost: parts[1],
-      remotePort: parseInt(parts[2], 10)
-    };
-  } else if (parts.length === 4) {
-    return {
-      id,
-      type,
-      localHost: parts[0],
-      localPort: parseInt(parts[1], 10),
-      remoteHost: parts[2],
-      remotePort: parseInt(parts[3], 10)
-    };
-  } else {
+  if (parts.length !== 3 && parts.length !== 4) {
     throw new Error(`Invalid port forwarding specification: "${spec}". Expected "[bind_address:]port:host:hostport"`);
   }
+  const [bindHost, bindPortText, targetHost, targetPortText] = parts.length === 4
+    ? parts
+    : ['127.0.0.1', ...parts];
+  const bindPort = parseInt(bindPortText, 10);
+  const targetPort = parseInt(targetPortText, 10);
+  return type === 'local'
+    ? { id, type, localHost: bindHost, localPort: bindPort, remoteHost: targetHost, remotePort: targetPort }
+    : { id, type, localHost: targetHost, localPort: targetPort, remoteHost: bindHost, remotePort: bindPort };
 }

@@ -174,14 +174,14 @@ export class TuiApp {
     return false;
   }
 
-  private suspend(): void {
+  private suspendForConnection(): void {
     this.inModal = true;
     if (process.stdin.isTTY && process.stdin.setRawMode) {
       process.stdin.setRawMode(false);
     }
   }
 
-  private resume(): void {
+  private resumeAfterConnection(): void {
     this.inModal = false;
     if (process.stdin.isTTY && process.stdin.setRawMode) {
       process.stdin.setRawMode(true);
@@ -220,36 +220,34 @@ export class TuiApp {
     this.hostsScreen.statusMessage = `updated ${profile.name}`;
   }
 
-  private async editForm(title: string, fields: FormField[]): Promise<Record<string, string> | null> {
-    this.suspend();
-    const result = await runForm(
-      this.screen,
-      this.theme,
-      title,
-      fields,
-      'tab/↑↓ field   enter next   ctrl-s save   esc cancel'
-    );
-    this.resume();
-    if (result.cancelled) {
-      this.hostsScreen.statusMessage = 'cancelled';
-      return null;
+  private async editForm(
+    title: string,
+    fields: FormField[],
+    footerHint = 'tab/↑↓ field   enter next   ctrl-s save   esc cancel'
+  ): Promise<Record<string, string> | null> {
+    this.inModal = true;
+    try {
+      const result = await runForm(this.screen, this.theme, title, fields, footerHint);
+      if (result.cancelled) {
+        this.hostsScreen.statusMessage = 'cancelled';
+        return null;
+      }
+      return result.values;
+    } finally {
+      this.inModal = false;
     }
-    return result.values;
   }
 
   private async deleteHost(): Promise<void> {
     const current = this.hostsScreen.getSelectedHost();
     if (!current) return;
-    this.suspend();
-    const result = await runForm(
-      this.screen,
-      this.theme,
+    const values = await this.editForm(
       `Delete ${current.name}?`,
       [{ key: 'confirm', label: 'type yes', value: '', hint: 'yes' }],
       'type yes then ctrl-s to delete   esc cancel'
     );
-    this.resume();
-    if (result.cancelled || result.values.confirm.trim().toLowerCase() !== 'yes') {
+    if (!values) return;
+    if (values.confirm.trim().toLowerCase() !== 'yes') {
       this.hostsScreen.statusMessage = 'cancelled';
       return;
     }
@@ -259,20 +257,13 @@ export class TuiApp {
   }
 
   private async importConfig(): Promise<void> {
-    this.suspend();
-    const result = await runForm(
-      this.screen,
-      this.theme,
+    const values = await this.editForm(
       'Import OpenSSH config',
       [{ key: 'path', label: 'config path', value: '~/.ssh/config' }],
       'ctrl-s import   esc cancel'
     );
-    this.resume();
-    if (result.cancelled) {
-      this.hostsScreen.statusMessage = 'cancelled';
-      return;
-    }
-    const imported = defaultConfigManager.importOpenSSHConfig(result.values.path || undefined);
+    if (!values) return;
+    const imported = defaultConfigManager.importOpenSSHConfig(values.path || undefined);
     this.hostsScreen.refreshHosts();
     this.hostsScreen.statusMessage = `imported ${imported.length} host(s)`;
   }
@@ -307,9 +298,9 @@ export class TuiApp {
   private async connectSelected(): Promise<void> {
     const host = this.hostsScreen.getSelectedHost();
     if (!host) return;
-    this.suspend();
-    this.screen.exitAltScreen();
     try {
+      this.suspendForConnection();
+      this.screen.exitAltScreen();
       await runConnect(host.id, { noExitOnError: true });
     } catch (err: any) {
       process.stdout.write(`\n${colors.yellow}Press any key to return to sshx...${colors.reset}`);
@@ -322,9 +313,9 @@ export class TuiApp {
       }
       this.hostsScreen.statusMessage = `Connection failed: ${err?.message || err}`;
     } finally {
+      this.resumeAfterConnection();
       this.screen.updateDimensions();
       this.screen.enterAltScreen();
-      this.resume();
       this.hostsScreen.refreshHosts();
       this.render();
     }

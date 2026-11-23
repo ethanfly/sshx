@@ -1,6 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
-import { KeyManager } from '../core/keygen.js';
+import { GeneratedKeyFiles, KeyManager } from '../core/keygen.js';
 import { colors, prompt } from './utils.js';
 
 export interface KeygenCliOptions {
@@ -38,12 +38,23 @@ export async function runKeygen(options: KeygenCliOptions = {}): Promise<void> {
   const comment = options.comment || `${os.userInfo().username}@${os.hostname()}`;
 
   process.stdout.write(`Generating public/private ${type} key pair...\n`);
-  const result = KeyManager.saveKeyPairToDisk(filePath, {
-    type,
-    bits,
-    comment,
-    passphrase: passphrase || undefined
-  });
+  let result: GeneratedKeyFiles;
+  try {
+    result = KeyManager.saveKeyPairToDisk(filePath, {
+      type,
+      bits,
+      comment,
+      passphrase: passphrase || undefined
+    });
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException;
+    const message = error.code === 'EEXIST'
+      ? `Key file already exists: ${error.path || filePath}. Choose a different path.`
+      : error.message;
+    process.stderr.write(`${colors.red}Key generation failed: ${message}${colors.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
 
   process.stdout.write(`${colors.green}Your identification has been saved in ${result.privateKeyPath}${colors.reset}\n`);
   process.stdout.write(`${colors.green}Your public key has been saved in ${result.publicKeyPath}${colors.reset}\n`);

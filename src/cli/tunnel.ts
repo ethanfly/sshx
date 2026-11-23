@@ -15,47 +15,56 @@ export async function runTunnel(target: string, options: TunnelCliOptions = {}):
     profile = resolveTarget(target, options);
   } catch (err: any) {
     process.stderr.write(`${colors.red}Error: ${err.message || String(err)}${colors.reset}\n`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
-  const conn = new SSHConnection({ profile });
 
   if (!options.localForward && !options.remoteForward && !options.dynamicForward) {
     process.stderr.write(`${colors.red}Error: Please specify at least one tunnel (-L, -R, or -D)${colors.reset}\n`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
+
+  const conn = new SSHConnection({ profile });
+  const client = conn.getRawClient();
+  const tm = new TunnelManager(client);
+  let userStopped = false;
+  let transportClosed = false;
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+  const onClose = () => {
+    transportClosed = true;
+    resolveClosed();
+  };
+  const onSignal = () => {
+    if (userStopped || transportClosed) return;
+    userStopped = true;
+    process.stdout.write(`\n${colors.dim}Stopping tunnels...${colors.reset}\n`);
+    conn.disconnect();
+  };
+  client.once('close', onClose);
 
   try {
     process.stdout.write(`${colors.dim}Connecting to ${profile.host} for tunneling...${colors.reset}\n`);
     await conn.connect();
+    process.on('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
     process.stdout.write(`${colors.green}✓ Connected.${colors.reset}\n\n`);
 
-    const tm = new TunnelManager(conn.getRawClient());
-
-    if (options.localForward) {
-      for (const spec of options.localForward) {
-        const config = parsePortForwardString(spec, 'local');
+    for (const [type, specs] of [
+      ['local', options.localForward],
+      ['remote', options.remoteForward],
+      ['dynamic', options.dynamicForward]
+    ] as const) {
+      for (const spec of specs ?? []) {
+        if (userStopped || transportClosed) break;
+        const config = parsePortForwardString(spec, type);
         const tunnel = await tm.addTunnel(config);
         await tunnel.start();
       }
     }
 
-    if (options.remoteForward) {
-      for (const spec of options.remoteForward) {
-        const config = parsePortForwardString(spec, 'remote');
-        const tunnel = await tm.addTunnel(config);
-        await tunnel.start();
-      }
-    }
-
-    if (options.dynamicForward) {
-      for (const spec of options.dynamicForward) {
-        const config = parsePortForwardString(spec, 'dynamic');
-        const tunnel = await tm.addTunnel(config);
-        await tunnel.start();
-      }
-    }
-
-    const printStatus = () => {
+    if (!userStopped && !transportClosed) {
       const tunnels = tm.getTunnels();
       const rows = tunnels.map(t => [
         t.id,
@@ -68,28 +77,23 @@ export async function runTunnel(target: string, options: TunnelCliOptions = {}):
       ]);
 
       process.stdout.write(renderTable(['ID', 'Type', 'Local Bind', 'Remote Target', 'Status', 'Active Conns', 'Traffic'], rows) + '\n');
-    };
-
-    printStatus();
-    process.stdout.write(`\n${colors.cyan}Tunnels active. Press Ctrl+C to stop.${colors.reset}\n`);
-
-    const interval = setInterval(() => {
-      // Periodically refresh stats if needed
-    }, 5000);
-
-    const onExit = async () => {
-      clearInterval(interval);
-      process.stdout.write(`\n${colors.dim}Stopping tunnels...${colors.reset}\n`);
-      await tm.stopAll();
-      conn.disconnect();
-      process.exit(0);
-    };
-
-    process.on('SIGINT', onExit);
-    process.on('SIGTERM', onExit);
+      process.stdout.write(`\n${colors.cyan}Tunnels active. Press Ctrl+C to stop.${colors.reset}\n`);
+    }
+    await closed;
+    if (!userStopped) throw new Error('SSH connection closed unexpectedly');
   } catch (err: any) {
+    if (!userStopped) {
+      process.stderr.write(`${colors.red}Tunnel error: ${err.message || String(err)}${colors.reset}\n`);
+      process.exitCode = 1;
+    }
+  } finally {
     conn.disconnect();
-    process.stderr.write(`${colors.red}Tunnel error: ${err.message || String(err)}${colors.reset}\n`);
-    process.exit(1);
+    try {
+      await tm.stopAll();
+    } finally {
+      client.removeListener('close', onClose);
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
+    }
   }
 }

@@ -299,11 +299,29 @@ export class SFTPClient {
    */
   public async rm(remotePath: string, recursive: boolean = true): Promise<void> {
     const sftp = await this.getWrapper();
-    const stat = await this.stat(remotePath);
+    const entryPath = remotePath.replace(/\/+$/, '') || remotePath;
+    const fileType = await new Promise<number>((resolve, reject) => {
+      sftp.lstat(entryPath, (err, stats) => {
+        if (err) return reject(err);
+        const fileType = (stats?.mode ?? 0) & fs.constants.S_IFMT;
+        resolve(fileType);
+      });
+    });
 
-    if (!stat.isDirectory) {
+    if (fileType !== fs.constants.S_IFDIR) {
+      const unlinkable = [
+        fs.constants.S_IFREG,
+        fs.constants.S_IFLNK,
+        fs.constants.S_IFBLK,
+        fs.constants.S_IFCHR,
+        fs.constants.S_IFIFO,
+        fs.constants.S_IFSOCK
+      ];
+      if (!unlinkable.includes(fileType)) {
+        throw new Error(`Cannot determine remote file type: ${entryPath}`);
+      }
       return new Promise<void>((resolve, reject) => {
-        sftp.unlink(remotePath, (err) => {
+        sftp.unlink(entryPath, (err) => {
           if (err) return reject(err);
           resolve();
         });
@@ -312,7 +330,7 @@ export class SFTPClient {
 
     if (!recursive) {
       return new Promise<void>((resolve, reject) => {
-        sftp.rmdir(remotePath, (err) => {
+        sftp.rmdir(entryPath, (err) => {
           if (err) return reject(err);
           resolve();
         });
@@ -320,14 +338,14 @@ export class SFTPClient {
     }
 
     // Recursive directory removal
-    const entries = await this.list(remotePath);
+    const entries = await this.list(entryPath);
     for (const entry of entries) {
       if (entry.filename === '.' || entry.filename === '..') continue;
       await this.rm(entry.path, true);
     }
 
     return new Promise<void>((resolve, reject) => {
-      sftp.rmdir(remotePath, (err) => {
+      sftp.rmdir(entryPath, (err) => {
         if (err) return reject(err);
         resolve();
       });

@@ -1,29 +1,101 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 
-export interface HostProfile {
-  id: string;
-  name: string;
-  host: string;
-  port: number;
-  username: string;
-  authType: 'password' | 'privateKey' | 'agent' | 'keyboard-interactive';
-  password?: string;
-  privateKeyPath?: string;
-  privateKey?: string;
-  passphrase?: string;
-  proxyJump?: string; // ID or name of another HostProfile
-  proxyCommand?: string;
-  keepaliveInterval?: number; // milliseconds (default 15000)
-  keepaliveCountMax?: number; // max missed keepalives before disconnect (default 3)
-  readyTimeout?: number; // ms to wait for handshake (default 20000)
-  tags?: string[];
-  group?: string;
-  environment?: Record<string, string>;
-  lastConnected?: string;
-  favorite?: boolean;
-  notes?: string;
+const hostProfileSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().trim().min(1),
+  host: z.string().min(1),
+  port: z.union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
+    .pipe(z.number().int().min(1).max(65535)),
+  username: z.string().min(1),
+  authType: z.enum(['password', 'privateKey', 'agent', 'keyboard-interactive', 'key'])
+    .transform(authType => authType === 'key' ? 'privateKey' : authType),
+  password: z.string().optional(),
+  privateKeyPath: z.string().optional(),
+  privateKey: z.string().optional(),
+  passphrase: z.string().optional(),
+  proxyJump: z.string().optional(),
+  proxyCommand: z.string().optional(),
+  keepaliveInterval: z.number().optional(),
+  keepaliveCountMax: z.number().optional(),
+  readyTimeout: z.number().optional(),
+  tags: z.array(z.string()).optional(),
+  group: z.string().optional(),
+  environment: z.record(z.string(), z.string()).optional(),
+  lastConnected: z.string().optional(),
+  favorite: z.boolean().optional(),
+  notes: z.string().optional()
+});
+const importedHostSchema = hostProfileSchema.partial({ id: true, port: true, username: true, authType: true });
+const hostListSchema = z.array(hostProfileSchema);
+const importedHostListSchema = z.array(importedHostSchema);
+
+export type HostProfile = z.infer<typeof hostProfileSchema>;
+type HostInput = z.infer<typeof importedHostSchema>;
+
+export class DuplicateHostError extends Error {
+  constructor(name: string) {
+    super(`Host "${name}" already exists.`);
+    this.name = 'DuplicateHostError';
+  }
+}
+
+function hostNameKey(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function requireUniqueHosts(hosts: HostProfile[]): void {
+  const ids = new Set<string>();
+  const names = new Set<string>();
+  for (const host of hosts) {
+    const name = hostNameKey(host.name);
+    if (ids.has(host.id) || names.has(name)) {
+      throw new Error('Saved host profiles contain duplicate names or IDs. Rename or remove the duplicates before continuing.');
+    }
+    ids.add(host.id);
+    names.add(name);
+  }
+}
+
+function mergeHostProfile(profile: HostInput, existing?: HostProfile): HostProfile {
+  const endpointChanged = existing && (profile.host !== existing.host ||
+    (profile.port ?? existing.port) !== existing.port || (profile.username ?? existing.username) !== existing.username);
+  const inherited = {
+    ...existing,
+    ...(endpointChanged ? {
+      authType: undefined,
+      password: undefined,
+      privateKeyPath: undefined,
+      privateKey: undefined,
+      passphrase: undefined,
+      proxyJump: undefined,
+      proxyCommand: undefined
+    } : {})
+  };
+  if (existing && !endpointChanged) {
+    const newPath = profile.privateKeyPath;
+    const oldPath = existing.privateKeyPath;
+    const pathChanged = newPath !== undefined && toPortablePath(newPath) !== toPortablePath(oldPath ?? '');
+    if (pathChanged && profile.privateKey === undefined) inherited.privateKey = undefined;
+    const inlineKey = profile.privateKey ?? inherited.privateKey;
+    if (inlineKey !== existing.privateKey || (pathChanged && !inlineKey)) inherited.passphrase = undefined;
+  }
+  const normalized = hostProfileSchema.parse({
+    port: 22,
+    username: 'root',
+    tags: [],
+    ...inherited,
+    ...Object.fromEntries(Object.entries(profile).filter(([, value]) => value !== undefined)),
+    id: existing?.id ?? profile.id ?? `host_${randomUUID()}`,
+    authType: profile.authType ?? inherited.authType ?? (profile.privateKeyPath || profile.privateKey ? 'privateKey' : 'password')
+  });
+  if (normalized.privateKeyPath) {
+    normalized.privateKeyPath = toPortablePath(normalized.privateKeyPath);
+  }
+  return normalized;
 }
 
 export interface AppConfig {
@@ -155,40 +227,71 @@ export class ConfigManager {
     return updated;
   }
 
-  public getHosts(): HostProfile[] {
+  public getHosts(options: { requireExisting?: boolean } = {}): HostProfile[] {
     this.ensureDirs();
-    if (!fs.existsSync(this.hostsFilePath)) {
-      return [];
-    }
+    let raw: string;
     try {
-      const raw = fs.readFileSync(this.hostsFilePath, 'utf8');
-      const hosts: HostProfile[] = JSON.parse(raw);
-      return Array.isArray(hosts) ? hosts : [];
-    } catch {
-      return [];
+      raw = fs.readFileSync(this.hostsFilePath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        if (!options.requireExisting) return [];
+        throw new Error(`No saved hosts file at '${this.hostsFilePath}'. Run 'sshx sync pull' first if restoring a remote backup.`);
+      }
+      throw new Error(`Could not read hosts file '${this.hostsFilePath}': ${(error as Error).message}`);
     }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`Invalid JSON in hosts file '${this.hostsFilePath}'.`);
+    }
+
+    const result = hostListSchema.safeParse(parsed);
+    if (!result.success) {
+      const location = result.error.issues[0].path.join('.') || 'root';
+      throw new Error(`Invalid host profiles in '${this.hostsFilePath}' (at ${location}).`);
+    }
+    return result.data;
   }
 
   public saveHosts(hosts: HostProfile[]): void {
     this.ensureDirs();
-    fs.writeFileSync(this.hostsFilePath, JSON.stringify(hosts, null, 2), {
-      mode: 0o600
-    });
+    const data = JSON.stringify(hostListSchema.parse(hosts), null, 2);
+    const temporary = `${this.hostsFilePath}.${randomUUID()}.tmp`;
+    const descriptor = fs.openSync(temporary, 'wx', 0o600);
+    try {
+      try {
+        fs.writeFileSync(descriptor, data);
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      fs.renameSync(temporary, this.hostsFilePath);
+    } catch (error) {
+      try { fs.unlinkSync(temporary); } catch {}
+      throw error;
+    }
   }
 
   public getHost(idOrName: string): HostProfile | undefined {
     const hosts = this.getHosts();
-    const query = idOrName.trim().toLowerCase();
+    const query = hostNameKey(idOrName);
     // 1. Exact match by ID
     const byId = hosts.find(h => h.id === idOrName);
     if (byId) return byId;
 
     // 2. Exact match by Name (case-insensitive)
-    const byName = hosts.find(h => h.name.toLowerCase() === query);
+    const byName = hosts.find(h => hostNameKey(h.name) === query);
     if (byName) return byName;
 
     // 3. Match by Host (case-insensitive)
     return hosts.find(h => h.host.toLowerCase() === query);
+  }
+
+  public getHostByName(name: string): HostProfile | undefined {
+    const query = hostNameKey(name);
+    return this.getHosts().find(host => hostNameKey(host.name) === query);
   }
 
   public resolveKeyPath(keyPath?: string): string | undefined {
@@ -265,18 +368,17 @@ export class ConfigManager {
     return scored.slice(0, limit).map(s => s.host);
   }
 
-  public addHost(profile: Omit<HostProfile, 'id'> & { id?: string }): HostProfile {
+  public addHost(profile: HostInput, options: { overwrite?: boolean } = {}): HostProfile {
     const hosts = this.getHosts();
-    const newHost: HostProfile = {
-      ...profile,
-      id: profile.id || `host_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      port: profile.port !== undefined ? Number(profile.port) : 22,
-      authType: profile.authType || (profile.privateKeyPath || profile.privateKey ? 'privateKey' : 'password'),
-      privateKeyPath: profile.privateKeyPath ? toPortablePath(profile.privateKeyPath) : undefined,
-      tags: profile.tags || []
-    };
+    const profileName = hostNameKey(profile.name);
+    const byId = hosts.findIndex(host => host.id === profile.id);
+    const byName = hosts.findIndex(host => hostNameKey(host.name) === profileName);
+    const existingIndex = byId >= 0 ? byId : byName;
+    if (existingIndex >= 0 && (!options.overwrite || (byId >= 0 && byName >= 0 && byId !== byName))) {
+      throw new DuplicateHostError(profile.name);
+    }
 
-    const existingIndex = hosts.findIndex(h => h.id === newHost.id || h.name.toLowerCase() === newHost.name.toLowerCase());
+    const newHost = mergeHostProfile(profile, hosts[existingIndex]);
     if (existingIndex >= 0) {
       hosts[existingIndex] = newHost;
     } else {
@@ -289,27 +391,41 @@ export class ConfigManager {
 
   public updateHost(idOrName: string, updates: Partial<HostProfile>): HostProfile | null {
     const hosts = this.getHosts();
-    const index = hosts.findIndex(h => h.id === idOrName || h.name.toLowerCase() === idOrName.toLowerCase());
+    const byId = hosts.findIndex(host => host.id === idOrName);
+    const index = byId >= 0 ? byId : hosts.findIndex(host => hostNameKey(host.name) === hostNameKey(idOrName));
     if (index === -1) return null;
 
-    const normalizedUpdates = { ...updates };
-    if (normalizedUpdates.port !== undefined) {
-      normalizedUpdates.port = Number(normalizedUpdates.port);
+    const current = hosts[index];
+    const updated = hostProfileSchema.parse({
+      ...current,
+      ...updates,
+      id: current.id,
+      name: updates.name ?? current.name,
+      host: updates.host ?? current.host,
+      port: updates.port ?? current.port,
+      username: updates.username ?? current.username,
+      authType: updates.authType ?? current.authType
+    });
+    if (hostNameKey(updated.name) !== hostNameKey(current.name) &&
+        hosts.some(host => hostNameKey(host.name) === hostNameKey(updated.name))) {
+      throw new DuplicateHostError(updated.name);
     }
-    if (normalizedUpdates.privateKeyPath) {
-      normalizedUpdates.privateKeyPath = toPortablePath(normalizedUpdates.privateKeyPath);
+    if (updated.privateKeyPath) {
+      updated.privateKeyPath = toPortablePath(updated.privateKeyPath);
     }
 
-    hosts[index] = { ...hosts[index], ...normalizedUpdates };
+    hosts[index] = updated;
     this.saveHosts(hosts);
-    return hosts[index];
+    return updated;
   }
 
   public deleteHost(idOrName: string): boolean {
     const hosts = this.getHosts();
-    const filtered = hosts.filter(h => h.id !== idOrName && h.name.toLowerCase() !== idOrName.toLowerCase());
-    if (filtered.length === hosts.length) return false;
-    this.saveHosts(filtered);
+    const byId = hosts.findIndex(host => host.id === idOrName);
+    const index = byId >= 0 ? byId : hosts.findIndex(host => hostNameKey(host.name) === hostNameKey(idOrName));
+    if (index === -1) return false;
+    hosts.splice(index, 1);
+    this.saveHosts(hosts);
     return true;
   }
 
@@ -323,69 +439,71 @@ export class ConfigManager {
    * Export all host profiles to a portable JSON file or string
    */
   public exportHosts(exportPath?: string): string {
-    const hosts = this.getHosts();
-    // Ensure all privateKeyPaths are stored as portable paths
-    const portableHosts = hosts.map(h => ({
-      ...h,
-      privateKeyPath: h.privateKeyPath ? toPortablePath(h.privateKeyPath) : undefined
-    }));
-    const jsonStr = JSON.stringify(portableHosts, null, 2);
-
+    const { json } = this.exportHostSnapshot();
     if (exportPath) {
       const resolved = resolvePortablePath(exportPath);
       const dir = path.dirname(resolved);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(resolved, jsonStr, { mode: 0o600 });
+      fs.writeFileSync(resolved, json, { mode: 0o600 });
     }
+    return json;
+  }
 
-    return jsonStr;
+  public exportHostSnapshot(options: { requireExisting?: boolean } = {}): { json: string; count: number } {
+    const hosts = this.getHosts(options);
+    requireUniqueHosts(hosts);
+    const portableHosts = hosts.map(host => ({
+      ...host,
+      privateKeyPath: host.privateKeyPath ? toPortablePath(host.privateKeyPath) : undefined
+    }));
+    return { json: JSON.stringify(portableHosts, null, 2), count: hosts.length };
   }
 
   /**
    * Import host profiles from a JSON string directly
    */
   public importHostsFromJson(content: string, mode: 'merge' | 'overwrite' = 'merge'): { imported: number; updated: number; total: number } {
-    const parsed = JSON.parse(content);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`Invalid configuration format: expected an array of host profiles.`);
-    }
-
-    let existing = mode === 'overwrite' ? [] : this.getHosts();
-    let imported = 0;
+    const parsed: unknown = JSON.parse(content);
+    const incoming = importedHostListSchema.parse(parsed);
+    const existing = mode === 'overwrite' ? [] : this.getHosts();
+    requireUniqueHosts(existing);
+    const hostsById = new Map(existing.map(profile => [profile.id, profile]));
+    const hostsByName = new Map(existing.map(profile => [hostNameKey(profile.name), profile]));
+    const mappedIds = new Map<string, string>();
+    const changedIds = new Set<string>();
+    const changedNames = new Set<string>();
     let updated = 0;
 
-    for (const raw of parsed) {
-      if (!raw.name || !raw.host) continue;
-
-      const profile: HostProfile = {
-        id: raw.id || `host_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        name: raw.name,
-        host: raw.host,
-        port: raw.port || 22,
-        username: raw.username || 'root',
-        authType: raw.authType || 'password',
-        password: raw.password,
-        privateKeyPath: raw.privateKeyPath ? toPortablePath(raw.privateKeyPath) : undefined,
-        tags: Array.isArray(raw.tags) ? raw.tags : [],
-        notes: raw.notes,
-        proxyJump: raw.proxyJump,
-        proxyCommand: raw.proxyCommand,
-        lastConnected: raw.lastConnected,
-        favorite: raw.favorite
-      };
-
-      const matchIdx = existing.findIndex(e => e.id === profile.id || e.name.toLowerCase() === profile.name.toLowerCase());
-      if (matchIdx >= 0) {
-        existing[matchIdx] = { ...existing[matchIdx], ...profile };
-        updated++;
-      } else {
-        existing.push(profile);
-        imported++;
+    const changes = incoming.map(profile => {
+      const name = hostNameKey(profile.name);
+      const byId = profile.id === undefined ? undefined : hostsById.get(profile.id);
+      const byName = hostsByName.get(name);
+      if (byId && byName && byId !== byName) {
+        throw new DuplicateHostError(profile.name);
       }
-    }
+      const current = byId ?? byName;
+      const merged = mergeHostProfile(profile, current);
+      if (changedIds.has(merged.id) || changedNames.has(name) || (profile.id !== undefined && mappedIds.has(profile.id))) {
+        throw new DuplicateHostError(profile.name);
+      }
+      changedIds.add(merged.id);
+      changedNames.add(name);
+      if (profile.id !== undefined) mappedIds.set(profile.id, merged.id);
+      if (current) updated++;
+      return merged;
+    });
 
-    this.saveHosts(existing);
-    return { imported, updated, total: existing.length };
+    changes.forEach((profile, index) => {
+      const incomingJump = incoming[index].proxyJump;
+      if (incomingJump !== undefined) {
+        profile.proxyJump = mappedIds.get(incomingJump) ?? incomingJump;
+      }
+      hostsById.set(profile.id, profile);
+    });
+
+    const hosts = [...hostsById.values()];
+    this.saveHosts(hosts);
+    return { imported: changes.length - updated, updated, total: hosts.length };
   }
 
   /**
@@ -412,19 +530,16 @@ export class ConfigManager {
 
     const imported = parseOpenSSHConfigFile(targetPath);
     const existing = this.getHosts();
+    const names = new Set(existing.map(profile => hostNameKey(profile.name)));
 
     const result: HostProfile[] = [];
     for (const item of imported) {
-      const match = existing.find(e => e.name.toLowerCase() === item.name.toLowerCase());
-      if (match) {
-        const updated = { ...match, ...item, id: match.id };
-        this.updateHost(match.id, updated);
-        result.push(updated);
-      } else {
-        const added = this.addHost(item);
-        result.push(added);
-      }
+      const name = hostNameKey(item.name);
+      if (names.has(name)) continue;
+      result.push(mergeHostProfile(item));
+      names.add(name);
     }
+    if (result.length > 0) this.saveHosts([...existing, ...result]);
     return result;
   }
 }

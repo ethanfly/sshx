@@ -146,20 +146,22 @@ export class MockSSHServer {
       sftpStream.name(reqid, [{ filename: '/', longname: '/' }]);
     });
 
-    sftpStream.on('STAT', (reqid: number, str: string) => {
-      const target = path.join(this.tempDir, str);
-      try {
-        const stat = fs.statSync(target);
-        sftpStream.attrs(reqid, {
-          mode: stat.mode,
-          size: stat.size,
-          mtime: Math.floor(stat.mtimeMs / 1000),
-          atime: Math.floor(stat.atimeMs / 1000)
-        });
-      } catch {
-        sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
-      }
-    });
+    for (const [request, readStats] of [['STAT', fs.statSync], ['LSTAT', fs.lstatSync]] as const) {
+      sftpStream.on(request, (reqid: number, str: string) => {
+        const target = path.join(this.tempDir, str);
+        try {
+          const stat = readStats(target);
+          sftpStream.attrs(reqid, {
+            mode: stat.mode,
+            size: stat.size,
+            mtime: Math.floor(stat.mtimeMs / 1000),
+            atime: Math.floor(stat.atimeMs / 1000)
+          });
+        } catch {
+          sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
+        }
+      });
+    }
 
     const openDirs = new Map<string, { done: boolean }>();
     const openFiles = new Map<string, number>();

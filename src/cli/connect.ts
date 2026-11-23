@@ -160,14 +160,13 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
   process.stdout.write(`${colors.dim}Connecting to ${colors.reset}${colors.bold}${profile.username}@${profile.host}:${profile.port}${colors.reset}...\n`);
 
   const connection = new SSHConnection({ profile });
+  const tm = new TunnelManager(connection.getRawClient());
 
   try {
     await connection.connect();
     process.stdout.write(`${colors.green}✓ Connected successfully.${colors.reset}\n`);
 
     // Setup tunnels if requested
-    const tm = new TunnelManager(connection.getRawClient());
-
     if (options.localForward) {
       for (const spec of options.localForward) {
         const tunnelConfig = parsePortForwardString(spec, 'local');
@@ -202,21 +201,23 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
     });
 
     await splitSession.start();
-    splitSession.attachToLocalProcess();
-
-    await new Promise<void>((resolve) => {
-      splitSession.getSession().once('close', () => resolve());
-    });
-
-    await tm.stopAll();
-    connection.disconnect();
-    process.stdout.write(`\n${colors.dim}Connection closed.${colors.reset}\n`);
+    const session = splitSession.getSession();
+    if (session.running()) {
+      await new Promise<void>((resolve) => {
+        session.once('close', () => resolve());
+        splitSession.attachToLocalProcess();
+      });
+    }
   } catch (err: any) {
-    connection.disconnect();
     process.stderr.write(`${colors.red}Connection failed: ${err.message || String(err)}${colors.reset}\n`);
     if (options.noExitOnError) {
       throw err;
     }
-    process.exit(1);
+    process.exitCode = 1;
+    return;
+  } finally {
+    connection.disconnect();
+    await tm.stopAll();
   }
+  process.stdout.write(`\n${colors.dim}Connection closed.${colors.reset}\n`);
 }

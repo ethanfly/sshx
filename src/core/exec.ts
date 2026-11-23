@@ -1,3 +1,4 @@
+import { constants as osConstants } from 'node:os';
 import { Client, ClientChannel } from 'ssh2';
 
 export interface ExecOptions {
@@ -44,8 +45,8 @@ export async function execCommand(
 
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
-      let exitCode = 0;
-      let exitSignal: string | undefined = undefined;
+      let exitCode: number | undefined;
+      let exitSignal: string | undefined;
 
       if (options.timeout && options.timeout > 0) {
         timeoutTimer = setTimeout(() => {
@@ -82,8 +83,8 @@ export async function execCommand(
         }
       }
 
-      stream.on('exit', (code: number, signal?: string) => {
-        exitCode = code ?? 0;
+      stream.on('exit', (code: number | null, signal?: string) => {
+        exitCode = code ?? undefined;
         exitSignal = signal;
       });
 
@@ -91,6 +92,15 @@ export async function execCommand(
         if (finished) return;
         finished = true;
         if (timeoutTimer) clearTimeout(timeoutTimer);
+
+        if (exitSignal) {
+          const signalNumber = osConstants.signals[exitSignal as NodeJS.Signals];
+          exitCode = typeof signalNumber === 'number' && signalNumber > 0 ? 128 + signalNumber : 1;
+        }
+        if (exitCode === undefined) {
+          reject(new Error('SSH channel closed without a command exit status'));
+          return;
+        }
 
         const durationMs = Date.now() - startTime;
         resolve({

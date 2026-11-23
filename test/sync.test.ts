@@ -6,6 +6,7 @@ import os from 'node:os';
 import { encryptPayload, decryptPayload } from '../dist/sync/crypto.js';
 import { SyncManager } from '../dist/sync/manager.js';
 import { ConfigManager } from '../dist/core/config.js';
+import type { SyncProvider } from '../dist/sync/provider.js';
 
 test('Sync Crypto: encrypts and decrypts payload correctly with AES-256-GCM', () => {
   const plaintext = JSON.stringify([{ name: 'prod', host: '10.0.0.1', password: 'my-secret-password' }]);
@@ -35,7 +36,9 @@ test('Sync Crypto: fails decryption on corrupted or tampered ciphertext', () => 
   const encrypted = encryptPayload(plaintext, 'my-passphrase');
   const parsed = JSON.parse(encrypted);
   // Tamper ciphertext
-  parsed.ciphertext = parsed.ciphertext.replace(/^../, 'ff');
+  const ciphertext = Buffer.from(parsed.ciphertext, 'hex');
+  ciphertext[0] ^= 1;
+  parsed.ciphertext = ciphertext.toString('hex');
   const tampered = JSON.stringify(parsed);
 
   assert.throws(() => {
@@ -79,12 +82,27 @@ test('SyncManager: end-to-end push and pull using mock provider', async () => {
   try {
     // Node 1: add host profile
     const configMgr1 = new ConfigManager(tmpDir1);
-    configMgr1.addHost({
+    const source = configMgr1.addHost({
       name: 'node1-prod',
       host: '1.2.3.4',
-      port: 22,
+      port: 2222,
       username: 'root',
-      password: 'node1-secret-password'
+      authType: 'privateKey',
+      password: 'node1-secret-password',
+      privateKeyPath: '~/.ssh/test-identity',
+      privateKey: 'test private key fixture',
+      passphrase: 'test key passphrase',
+      proxyJump: 'jump-id',
+      proxyCommand: 'test proxy command',
+      keepaliveInterval: 30_000,
+      keepaliveCountMax: 6,
+      readyTimeout: 45_000,
+      tags: ['prod', 'devops'],
+      group: 'test group',
+      environment: { TZ: 'UTC' },
+      lastConnected: '2025-01-01T00:00:00.000Z',
+      favorite: true,
+      notes: 'test notes'
     });
 
     let remoteStorage: string = '';
@@ -130,12 +148,152 @@ test('SyncManager: end-to-end push and pull using mock provider', async () => {
     assert.strictEqual(pullRes.ok, true);
     assert.strictEqual(pullRes.imported, 1);
 
-    const node2Hosts = configMgr2.getHosts();
-    assert.strictEqual(node2Hosts.length, 1);
-    assert.strictEqual(node2Hosts[0].name, 'node1-prod');
-    assert.strictEqual(node2Hosts[0].password, 'node1-secret-password');
+    assert.deepStrictEqual(configMgr2.getHosts(), [source]);
   } finally {
     fs.rmSync(tmpDir1, { recursive: true, force: true });
     fs.rmSync(tmpDir2, { recursive: true, force: true });
+  }
+});
+
+test('SyncManager: rejects corrupt or unreadable host configuration without uploading', async () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-corrupt-'));
+  try {
+    const config = new ConfigManager(temporary);
+    const sync = new SyncManager(config);
+    sync.saveConfig({ provider: 'webdav', passphrase: 'test passphrase' });
+    const hostsFile = config.getHostsFilePath();
+    let providerRequested = false;
+    sync.getProvider = () => {
+      providerRequested = true;
+      throw new Error('Provider must not be touched');
+    };
+
+    assert.deepStrictEqual(config.getHosts(), []);
+    await assert.rejects(sync.push(), /No saved hosts file/);
+
+    for (const contents of ['{"incomplete":', '{}', '[{"name":"broken"}]']) {
+      fs.writeFileSync(hostsFile, contents);
+      await assert.rejects(sync.push(), /Invalid (JSON|host profiles)/);
+      assert.strictEqual(fs.readFileSync(hostsFile, 'utf8'), contents);
+    }
+    fs.unlinkSync(hostsFile);
+    fs.mkdirSync(hostsFile);
+    await assert.rejects(sync.push(), /Could not read hosts file|Invalid JSON/);
+    assert.strictEqual(providerRequested, false);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('SyncManager: refuses ambiguous legacy profiles but can upload an explicitly empty file', async () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-empty-'));
+  try {
+    const config = new ConfigManager(temporary);
+    const sync = new SyncManager(config);
+    const passphrase = 'test passphrase';
+    sync.saveConfig({ provider: 'webdav', passphrase });
+    let uploaded: string | undefined;
+    sync.getProvider = () => ({
+      name: 'memory',
+      async test() { return { ok: true, message: 'ok' }; },
+      async pull() { return uploaded ?? ''; },
+      async push(blob) { uploaded = blob; return {}; }
+    });
+
+    const original = config.addHost({ name: 'sample', host: 'sample.example.test' });
+    config.saveHosts([original, { ...original, id: 'legacy', name: 'Sample' }]);
+    assert.strictEqual(config.getHosts().length, 2);
+    await assert.rejects(sync.push(), /duplicate names or IDs/);
+    assert.strictEqual(uploaded, undefined);
+    config.updateHost('legacy', { name: 'another' });
+    assert.strictEqual(config.getHost('another')?.id, 'legacy');
+
+    config.saveHosts([]);
+    assert.strictEqual((await sync.push()).count, 0);
+    assert.ok(uploaded !== undefined);
+    assert.strictEqual(decryptPayload(uploaded, passphrase).plaintext, '[]');
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('ConfigManager: merging snapshots preserves local IDs and both sets of jump references', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-merge-'));
+  try {
+    const config = new ConfigManager(temporary);
+    config.addHost({
+      id: 'local-jump', name: 'jump', host: 'old.example.test', notes: 'keep this',
+      authType: 'privateKey', password: 'old password', privateKey: 'old key', privateKeyPath: '~/.ssh/old-key',
+      passphrase: 'old phrase', proxyJump: 'old-proxy-id', proxyCommand: 'old proxy command'
+    });
+    config.addHost({ id: 'local-target', name: 'local', host: 'local.example.test', proxyJump: 'local-jump' });
+
+    const incoming = JSON.stringify([
+      { id: 'remote-target', name: 'remote', host: 'remote.example.test', proxyJump: 'remote-jump' },
+      { id: 'remote-jump', name: 'Jump', host: 'new.example.test' }
+    ]);
+    assert.deepStrictEqual(config.importHostsFromJson(incoming), { imported: 1, updated: 1, total: 3 });
+    const jump = config.getHost('jump');
+    assert.strictEqual(jump?.id, 'local-jump');
+    assert.strictEqual(jump?.host, 'new.example.test');
+    assert.strictEqual(jump?.notes, 'keep this');
+    assert.strictEqual(jump?.authType, 'password');
+    assert.strictEqual(jump?.privateKey, undefined);
+    assert.strictEqual(jump?.privateKeyPath, undefined);
+    assert.strictEqual(jump?.passphrase, undefined);
+    assert.strictEqual(jump?.password, undefined);
+    assert.strictEqual(jump?.proxyCommand, undefined);
+    assert.strictEqual(jump?.proxyJump, undefined);
+    assert.strictEqual(config.getHost('local-target')?.proxyJump, 'local-jump');
+    assert.strictEqual(config.getHost('remote-target')?.proxyJump, 'local-jump');
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('ConfigManager: invalid overwrite import does not modify the saved hosts', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-invalid-import-'));
+  try {
+    const config = new ConfigManager(temporary);
+    const original = config.addHost({ name: 'good', host: 'good.example.test' });
+    const before = fs.readFileSync(config.getHostsFilePath(), 'utf8');
+    assert.throws(() => config.importHostsFromJson('[{"name":"broken"}]', 'overwrite'));
+    assert.strictEqual(fs.readFileSync(config.getHostsFilePath(), 'utf8'), before);
+    assert.deepStrictEqual(config.getHosts(), [original]);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('ConfigManager: replacement and merge do not reuse old credentials after a private key change', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-key-replace-'));
+  try {
+    const config = new ConfigManager(temporary);
+    const endpoint = { name: 'keyed', host: 'keyed.example.test' };
+    const original = config.addHost({
+      ...endpoint,
+      privateKey: 'original inline key',
+      privateKeyPath: '~/.ssh/original-key',
+      passphrase: 'original key passphrase'
+    });
+    const unchanged = config.addHost({ ...endpoint, privateKeyPath: original.privateKeyPath }, { overwrite: true });
+    assert.strictEqual(unchanged.privateKey, original.privateKey);
+    assert.strictEqual(unchanged.passphrase, original.passphrase);
+
+    const replacement = config.addHost({ ...endpoint, privateKeyPath: '~/.ssh/replacement-key' }, { overwrite: true });
+    assert.strictEqual(replacement.id, original.id);
+    assert.strictEqual(replacement.privateKeyPath, '~/.ssh/replacement-key');
+    assert.strictEqual(replacement.privateKey, undefined);
+    assert.strictEqual(replacement.passphrase, undefined);
+
+    config.importHostsFromJson(JSON.stringify([{ ...endpoint, privateKey: 'incoming key', passphrase: 'incoming phrase' }]));
+    assert.strictEqual(config.getHost(original.id)?.passphrase, 'incoming phrase');
+    config.importHostsFromJson(JSON.stringify([{ ...endpoint, privateKey: 'rotated inline key', privateKeyPath: '~/.ssh/rotated-key' }]));
+    const rotated = config.getHost(original.id);
+    assert.strictEqual(rotated?.privateKey, 'rotated inline key');
+    assert.strictEqual(rotated?.privateKeyPath, '~/.ssh/rotated-key');
+    assert.strictEqual(rotated?.passphrase, undefined);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
   }
 });

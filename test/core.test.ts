@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import ssh2 from 'ssh2';
 import {
   ConfigManager,
   KnownHostsManager,
@@ -19,6 +20,7 @@ import { stringWidth, padClip } from '../dist/tui/screen.js';
 import { TuiApp } from '../dist/tui/app.js';
 import { computeTableLayout } from '../dist/tui/screens/hosts.js';
 import { MockSSHServer } from './mock-server.ts';
+import { EventEmitter } from 'node:events';
 
 let mockServer: MockSSHServer;
 let serverPort: number;
@@ -135,20 +137,58 @@ Host server-alpha
   fs.rmSync(freshConfigDir, { recursive: true, force: true });
 });
 
-test('KeyManager: generates valid Ed25519 and RSA keys and saves to disk', () => {
-  const edKey = KeyManager.generateKeyPair({ type: 'ed25519', comment: 'test@ed' });
-  assert.ok(edKey.publicKeyOpenSSH.startsWith('ssh-ed25519 '));
-  assert.ok(edKey.fingerprintSha256.startsWith('SHA256:'));
-  assert.ok(edKey.privateKeyPem.includes('BEGIN PRIVATE KEY'));
+test('KeyManager: generated keys parse and match the exported public keys', () => {
+  for (const type of ['ed25519', 'rsa'] as const) {
+    for (const passphrase of [undefined, 'keygen-test-passphrase']) {
+      const key = KeyManager.generateKeyPair({ type, bits: 2048, comment: 'test-key', passphrase });
+      const parsed = ssh2.utils.parseKey(key.privateKeyPem, passphrase);
+      assert.ok(!(parsed instanceof Error), String(parsed));
+      const [algorithm, publicKey] = key.publicKeyOpenSSH.split(' ');
+      assert.equal(algorithm, `ssh-${type}`);
+      assert.equal(parsed.getPublicSSH().toString('base64'), publicKey);
+      assert.ok(key.fingerprintSha256.startsWith('SHA256:'));
+      if (passphrase) assert.ok(ssh2.utils.parseKey(key.privateKeyPem) instanceof Error);
+    }
+  }
+});
 
-  const rsaKey = KeyManager.generateKeyPair({ type: 'rsa', bits: 2048, comment: 'test@rsa' });
-  assert.ok(rsaKey.publicKeyOpenSSH.startsWith('ssh-rsa '));
-  assert.ok(rsaKey.fingerprintSha256.startsWith('SHA256:'));
-
+test('KeyManager: saves new key pairs without replacing existing files', () => {
   const keyPath = path.join(tempConfigDir, 'id_test_ed25519');
-  const files = KeyManager.saveKeyPairToDisk(keyPath, { type: 'ed25519', comment: 'saved@test' });
-  assert.ok(fs.existsSync(files.privateKeyPath));
-  assert.ok(fs.existsSync(files.publicKeyPath));
+  const files = KeyManager.saveKeyPairToDisk(keyPath, { type: 'ed25519', comment: 'original-key' });
+  const originalPrivate = fs.readFileSync(files.privateKeyPath);
+  const originalPublic = fs.readFileSync(files.publicKeyPath);
+  assert.throws(() => KeyManager.saveKeyPairToDisk(keyPath, { comment: 'replacement' }), { code: 'EEXIST' });
+  assert.deepEqual(fs.readFileSync(files.privateKeyPath), originalPrivate);
+  assert.deepEqual(fs.readFileSync(files.publicKeyPath), originalPublic);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(keyPath).mode & 0o777, 0o600);
+
+  const publicOnlyPath = path.join(tempConfigDir, 'id_public_only');
+  fs.writeFileSync(`${publicOnlyPath}.pub`, originalPublic);
+  assert.throws(() => KeyManager.saveKeyPairToDisk(publicOnlyPath, {}), { code: 'EEXIST' });
+  assert.equal(fs.existsSync(publicOnlyPath), false);
+  assert.deepEqual(fs.readFileSync(`${publicOnlyPath}.pub`), originalPublic);
+});
+
+test('SSHConnection: authenticates with a newly generated encrypted Ed25519 key', async () => {
+  const privateKeyPath = path.join(tempConfigDir, 'id_generated_login');
+  const passphrase = 'login-test-passphrase';
+  KeyManager.saveKeyPairToDisk(privateKeyPath, { type: 'ed25519', passphrase });
+  const connection = new SSHConnection({
+    profile: {
+      id: 'generated-key-test', name: 'generated-key-test', host: '127.0.0.1', port: serverPort,
+      username: 'testuser', authType: 'privateKey', privateKeyPath, passphrase
+    },
+    configManager,
+    knownHostsManager: testKnownHosts
+  });
+  try {
+    await connection.connect();
+    const result = await execCommand(connection.getRawClient(), 'echo hello');
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, 'hello\n');
+  } finally {
+    connection.disconnect();
+  }
 });
 
 test('SSHConnection & execCommand: connects to mock server and executes commands', async () => {
@@ -201,6 +241,29 @@ test('SSHConnection: stored password authenticates even when authType is private
   const result = await execCommand(conn.getRawClient(), 'echo saved');
   assert.ok(result.stdout.includes('echo saved'));
   conn.disconnect();
+});
+
+test('SSHConnection: handles a transport error after ready and closes before ready', async (context) => {
+  const profile = {
+    id: 'transport-test', name: 'transport-test', host: '127.0.0.1', port: serverPort,
+    username: 'testuser', authType: 'agent' as const
+  };
+  const connection = new SSHConnection({ profile, configManager, knownHostsManager: testKnownHosts });
+  const transport = connection.getRawClient();
+  context.mock.method(transport, 'connect', () => transport);
+
+  const handshake = connection.connect();
+  transport.emit('close');
+  await assert.rejects(handshake, /closed before authentication/);
+
+  const nextHandshake = connection.connect();
+  transport.emit('ready');
+  await nextHandshake;
+  assert.equal(connection.connected(), true);
+  assert.doesNotThrow(() => transport.emit('error', new Error('test connection lost')));
+  assert.equal(connection.connected(), false);
+  transport.emit('close');
+  assert.equal(transport.listenerCount('error'), 0);
 });
 
 test('SFTPClient: lists, writes, reads, and deletes remote files', async () => {
@@ -310,23 +373,35 @@ test('KnownHostsManager: wire format keys, extractKeyType, and accept-new verifi
   assert.ok(res3.message.includes('WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED'));
 });
 
-test('TuiApp: suspend and resume lifecycle restores stdin flowing state and raw mode', () => {
-  const app = new TuiApp();
-  // suspend sets inModal and rawMode false
-  (app as any).suspend();
-  assert.equal((app as any).inModal, true);
+test('TuiApp: form save and cancel keep raw input, unlike SSH handoff', async (context) => {
+  const setRawMode = context.mock.fn();
+  const resume = context.mock.fn();
+  const input = Object.assign(new EventEmitter(), { isTTY: true, setRawMode, resume });
+  context.mock.getter(process, 'stdin', () => input as unknown as typeof process.stdin);
+  const app = new TuiApp() as any;
+  context.mock.method(app.screen, 'flush', () => {});
+  const fields = [{ key: 'name', label: 'name', value: '' }];
 
-  // simulate session pausing stdin
-  process.stdin.pause();
-  assert.equal(process.stdin.isPaused(), true);
+  const submission = app.editForm('New host', fields);
+  assert.equal(app.inModal, true);
+  input.emit('keypress', 'x', { name: 'x' });
+  input.emit('keypress', '\x13', { name: 's', ctrl: true });
+  assert.deepEqual(await submission, { name: 'x' });
+  assert.equal(app.inModal, false);
 
-  // resume must clear inModal, resume stdin flowing mode, and restore rawMode
-  (app as any).resume();
-  assert.equal((app as any).inModal, false);
-  assert.equal(process.stdin.isPaused(), false);
+  const cancellation = app.editForm('Edit host', fields);
+  input.emit('keypress', undefined, { name: 'escape' });
+  assert.equal(await cancellation, null);
+  assert.equal(app.inModal, false);
+  assert.equal(input.listenerCount('keypress'), 0);
+  assert.equal(setRawMode.mock.callCount(), 0);
 
-  // Restore paused state so node test runner does not wait for stdin
-  process.stdin.pause();
+  app.suspendForConnection();
+  assert.equal(app.inModal, true);
+  app.resumeAfterConnection();
+  assert.equal(app.inModal, false);
+  assert.deepEqual(setRawMode.mock.calls.map(call => call.arguments[0]), [false, true]);
+  assert.equal(resume.mock.callCount(), 1);
 });
 
 test('computeTableLayout: eliminates center gap and sizes columns proportionally', () => {

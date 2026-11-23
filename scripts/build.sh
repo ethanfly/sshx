@@ -6,13 +6,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "error: node is required (Node.js 20+)" >&2
+  echo "error: node is required (Node.js 22.12+)" >&2
   exit 1
 fi
 
-major="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$major" -lt 20 ]; then
-  echo "error: Node.js 20+ is required, found $(node -v)" >&2
+if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1)'; then
+  echo "error: Node.js 22.12+ is required, found $(node -v)" >&2
   exit 1
 fi
 

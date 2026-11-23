@@ -11,7 +11,7 @@
   <a href="https://www.npmjs.com/package/@ethanfly/sshx"><img src="https://img.shields.io/npm/dm/@ethanfly/sshx?color=818cf8&labelColor=0f172a" alt="npm downloads"></a>
   <a href="https://github.com/ethanfly/sshx/actions"><img src="https://img.shields.io/github/actions/workflow/status/ethanfly/sshx/build.yml?branch=master&color=34d399&labelColor=0f172a&label=build" alt="build status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-e879f9?labelColor=0f172a" alt="license"></a>
-  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D20-67e8f9?labelColor=0f172a&logo=node.js&logoColor=67e8f9" alt="node version"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D22.12-67e8f9?labelColor=0f172a&logo=node.js&logoColor=67e8f9" alt="node version"></a>
 </p>
 
 <p align="center">
@@ -47,7 +47,7 @@
 
 ## 环境要求
 
-- Node.js 20 或更高（开发与测试使用 Node.js 22+）
+- Node.js 22.12 或更高（依赖 `commander@15` 要求）
 - npm、pnpm 或 yarn 任一即可
 
 ## 安装
@@ -190,6 +190,7 @@ sshx sftp put user@example.com ./config.json /etc/myapp/config.json
 sshx sftp rm user@example.com /tmp/old.log
 
 sshx tunnel user@remote -L 8080:127.0.0.1:80 -D 1080
+sshx tunnel user@remote -R 9000:localhost:3000
 
 sshx ls
 sshx host list --json
@@ -200,6 +201,10 @@ sshx host import hosts.json
 
 sshx keygen -t ed25519 -f ~/.ssh/id_ed25519_new -C "me@laptop"
 ```
+
+`-R 9000:localhost:3000` 在远端监听 `9000`，转发到运行 `sshx` 的本机 `localhost:3000`。
+
+`sshx keygen` 生成 OpenSSH 格式的 Ed25519 密钥。如果指定的私钥或对应的 `.pub` 文件已存在，请改用新路径；命令不会覆盖旧文件。
 
 `sshx host add` 不带参数时会进入交互向导。常用参数：
 
@@ -215,6 +220,11 @@ sshx keygen -t ed25519 -f ~/.ssh/id_ed25519_new -C "me@laptop"
 | `-J, --jump` | 跳板机配置名 |
 | `-t, --tags` | 标签 |
 | `--notes` | 备注 |
+| `-f, --force` | 明确允许替换同名主机，保留原主机 ID |
+
+主机名不区分大小写；同名主机默认不覆盖。`--force` 替换到不同连接目标时，不沿用旧目标的认证和代理设置。
+
+`sshx sftp rm -r` 删除目录时，目录里的符号链接只会被删除，不会遍历它指向的目录。
 
 ## TUI
 
@@ -359,6 +369,8 @@ sshx sync pull --overwrite
 sshx sync status
 ```
 
+如果本地 `hosts.json` 不存在、无法读取、格式损坏或有重复主机，`sshx sync push` 会停止。新设备要恢复云端备份时，请先运行 `sshx sync pull`。
+
 > **TUI 快捷键**：在 `sshx tui` 启动器列表中直接按 **`S`** 键，亦可快速同步最新主机列表。
 
 ## MCP
@@ -446,6 +458,21 @@ pnpm test
 `hosts.json` 里的密码是明文，只靠文件权限 `0600` 保护。不要把这个文件提交到 git，也不要放进共享目录以外的不受信任位置。导出文件同样包含密码。
 
 ## 版本历史
+
+### v1.2.2 (2026-11-23)
+
+- 🛡️ **主机配置**：同名主机默认拒绝新增，`--force` 才覆盖并保留原 ID；`hosts.json` 以 `0600` 原子写入，读取时严格校验
+- ☁️ **云同步**：`sync push` 拒绝缺失、损坏或含重复主机的本地配置；导入保留全部字段并重映射跳板机引用；OpenSSH 导入跳过已有别名
+- 🔑 **密钥生成**：Ed25519 私钥改为 OpenSSH 格式；私钥或 `.pub` 已存在时拒绝覆盖
+- 🗑️ **SFTP 删除**：`sftp rm -r` 只删除符号链接本身，不再进入其指向的目录
+- 🔀 **端口转发**：修正 `-R` 转发方向；SSH 断开后 `sshx tunnel` 释放本地端口并以非零码退出
+- ⚙️ **exec**：远程命令被信号终止时返回 `128+N`；通道未给出退出状态时报错
+- 🖥️ **TUI / 看板**：表单中 `Ctrl+S` 可保存；看板仅在可见时采集，采集失败时显示重试提示
+- 📦 **环境要求**：明确声明 Node.js `>=22.12.0`
+
+### v1.2.1 (2026-11-20)
+
+- 🖥️ **看板重绘**：终端尺寸变化时重绘分屏视图
 
 ### v1.2.0 (2026-10-30)
 

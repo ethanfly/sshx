@@ -90,10 +90,9 @@ export class SyncManager {
       throw new Error('Passphrase is required to encrypt your host profiles.');
     }
 
-    const hosts = this.configManager.getHosts();
-    const exportJson = this.configManager.exportHosts();
+    const { json, count } = this.configManager.exportHostSnapshot({ requireExisting: true });
 
-    const encryptedBlob = encryptPayload(exportJson, resolvedPassphrase, hosts.length);
+    const encryptedBlob = encryptPayload(json, resolvedPassphrase, count);
     const provider = this.getProvider(config);
 
     const pushRes = await provider.push(encryptedBlob);
@@ -109,7 +108,7 @@ export class SyncManager {
 
     return {
       ok: true,
-      count: hosts.length,
+      count,
       remoteId: pushRes.remoteId,
       updatedAt
     };

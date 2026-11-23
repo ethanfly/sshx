@@ -18,24 +18,24 @@ export class SplitSession {
   private session: InteractiveSession;
   private collector?: MetricsCollector;
   private client: Client;
-  private options: SplitSessionOptions;
 
   private sidebarVisible: boolean;
   private sidebarWidth: number;
   private lastMetrics?: ServerMetrics;
+  private metricsUnavailable = false;
+  private attached = false;
   private isDestroyed = false;
   private enteredAltScreen = false;
 
   constructor(client: Client, options: SplitSessionOptions = {}) {
     this.client = client;
-    this.options = options;
 
     const totalCols = process.stdout.columns || 80;
     this.sidebarWidth = options.sidebarWidth || 34;
 
     // Default to visible if terminal is wide enough (>= 90 cols)
     const wantsSidebar = options.enableSidebar !== false;
-    this.sidebarVisible = wantsSidebar && totalCols >= 90;
+    this.sidebarVisible = wantsSidebar && this.isInteractive() && totalCols >= 90;
 
     const leftCols = this.computeShellCols(totalCols);
     const rows = process.stdout.rows || 24;
@@ -64,31 +64,42 @@ export class SplitSession {
    */
   public async start(): Promise<void> {
     await this.session.start();
+  }
 
-    // Start background metrics collector over multiplexed SSH channel
-    try {
-      this.collector = new MetricsCollector(this.client, 2500);
-      this.collector.on('update', (metrics: ServerMetrics) => {
-        this.lastMetrics = metrics;
-        if (this.sidebarVisible && !this.isDestroyed) {
-          this.drawSidebar();
-        }
-      });
-      this.collector.start();
-    } catch {
-      // Metrics collector is non-fatal; continue shell
+  private isInteractive(): boolean {
+    return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  }
+
+  private updateMetricsPolling(): void {
+    if (!this.attached || !this.sidebarVisible || !this.isInteractive()) {
+      this.collector?.stop();
+      return;
     }
+    if (!this.collector) {
+      this.collector = new MetricsCollector(this.client);
+      this.collector.on('update', (metrics: ServerMetrics) => {
+        this.metricsUnavailable = false;
+        this.lastMetrics = metrics;
+        this.drawSidebar();
+      });
+      this.collector.on('error', () => {
+        if (this.metricsUnavailable) return;
+        this.lastMetrics = undefined;
+        this.metricsUnavailable = true;
+        this.drawSidebar();
+      });
+    }
+    this.collector.start();
   }
 
   /**
    * Attach terminal stdin and stdout with split-pane multiplexing
    */
   public attachToLocalProcess(): void {
+    if (this.attached || this.isDestroyed || !this.session.running()) return;
+    this.attached = true;
     const stdin = process.stdin;
     const stdout = process.stdout;
-
-    const totalCols = stdout.columns || 80;
-    const totalRows = stdout.rows || 24;
 
     if (this.sidebarVisible && stdout.isTTY) {
       // Enter alternate screen buffer & clear to prevent previous terminal scrollback from showing
@@ -120,6 +131,7 @@ export class SplitSession {
       if (this.sidebarVisible && cols < 85) {
         // Automatically hide sidebar on narrow terminals
         this.sidebarVisible = false;
+        this.updateMetricsPolling();
       }
 
       const leftCols = this.computeShellCols(cols);
@@ -140,7 +152,7 @@ export class SplitSession {
       const str = chunk.toString('utf8');
 
       // F2: \x1bOQ or \x1b[12~  |  Ctrl+O: \x0f
-      if (str === '\x1bOQ' || str === '\x1b[12~' || str === '\x0f') {
+      if (this.isInteractive() && (str === '\x1bOQ' || str === '\x1b[12~' || str === '\x0f')) {
         this.toggleSidebar();
         return;
       }
@@ -151,20 +163,20 @@ export class SplitSession {
     stdin.on('data', onStdinData);
 
     // Shell output to stdout
-    this.session.on('data', (chunk: Buffer) => {
+    const onSessionData = (chunk: Buffer) => {
       stdout.write(chunk);
-    });
+    };
+    this.session.on('data', onSessionData);
 
     // Cleanup on session close
     this.session.once('close', () => {
       this.isDestroyed = true;
-      if (this.collector) {
-        this.collector.stop();
-      }
-      this.disableTerminalMargins();
+      this.attached = false;
+      this.updateMetricsPolling();
 
       if (this.enteredAltScreen && stdout.isTTY) {
         // Exit alternate screen buffer, cleanly restoring user's original terminal
+        this.disableTerminalMargins();
         stdout.write('\x1b[?1049l');
         this.enteredAltScreen = false;
       }
@@ -174,13 +186,16 @@ export class SplitSession {
         stdin.pause();
       }
       stdin.removeListener('data', onStdinData);
+      this.session.removeListener('data', onSessionData);
       if (stdout.isTTY) {
         stdout.removeListener('resize', onResize);
       }
     });
+    this.updateMetricsPolling();
   }
 
   public toggleSidebar(): void {
+    if (!this.attached || !this.isInteractive()) return;
     const stdout = process.stdout;
     const totalCols = stdout.columns || 80;
     const totalRows = stdout.rows || 24;
@@ -208,6 +223,7 @@ export class SplitSession {
       stdout.write('\x1b[2J\x1b[H');
       this.session.resize(totalCols, totalRows);
     }
+    this.updateMetricsPolling();
   }
 
   private enableTerminalMargins(): void {
@@ -229,7 +245,7 @@ export class SplitSession {
    * Draw the right-hand sidebar at its fixed column offset without moving the shell cursor
    */
   public drawSidebar(): void {
-    if (!this.sidebarVisible || this.isDestroyed || !process.stdout.isTTY) return;
+    if (!this.attached || !this.sidebarVisible || !this.isInteractive()) return;
 
     const stdout = process.stdout;
     const totalCols = stdout.columns || 80;
@@ -243,7 +259,8 @@ export class SplitSession {
       this.lastMetrics,
       this.sidebarWidth,
       totalRows,
-      defaultSidebarTheme
+      defaultSidebarTheme,
+      this.metricsUnavailable
     );
 
     let buf = '';

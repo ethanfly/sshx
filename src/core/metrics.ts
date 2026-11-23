@@ -133,8 +133,8 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
 
   public start(): void {
     if (this.timer) return;
-    this.poll(); // first poll immediately
-    this.timer = setInterval(() => this.poll(), this.intervalMs);
+    this.timer = setInterval(() => void this.poll(), this.intervalMs);
+    void this.poll();
   }
 
   public stop(): void {
@@ -145,18 +145,21 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
   }
 
   private async poll(): Promise<void> {
-    if (this.isCollecting) return;
+    const timer = this.timer;
+    if (!timer || this.isCollecting) return;
     this.isCollecting = true;
 
     try {
       const res = await execCommand(this.client, MetricsCollector.COLLECTOR_SCRIPT, { timeout: 4000 });
-      if (res.exitCode === 0) {
-        const metrics = this.parseOutput(res.stdout);
-        this.cachedMetrics = metrics;
-        this.emit('update', metrics);
+      if (this.timer !== timer) return;
+      if (res.exitCode !== 0) {
+        throw new Error(`Metrics probe exited with status ${res.exitCode}`);
       }
+      const metrics = this.parseOutput(res.stdout);
+      this.cachedMetrics = metrics;
+      this.emit('update', metrics);
     } catch (err) {
-      this.emit('error', err);
+      if (this.timer === timer && this.listenerCount('error') > 0) this.emit('error', err);
     } finally {
       this.isCollecting = false;
     }

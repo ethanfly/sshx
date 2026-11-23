@@ -71,7 +71,13 @@ class Rows {
 }
 
 export class SidebarRenderer {
-  public static render(metrics: ServerMetrics | undefined, width: number, height: number, theme: SidebarTheme = defaultSidebarTheme): string[] {
+  public static render(
+    metrics: ServerMetrics | undefined,
+    width: number,
+    height: number,
+    theme: SidebarTheme = defaultSidebarTheme,
+    metricsUnavailable = false
+  ): string[] {
     const lines: string[] = [];
     const innerW = Math.max(8, width - 4);
     const borderFillW = innerW + 2;
@@ -100,8 +106,12 @@ export class SidebarRenderer {
 
     if (!metrics) {
       lines.push(hr());
-      lines.push(rows.muted('Connecting to server...'));
-      lines.push(rows.muted('Gathering metrics...'));
+      if (metricsUnavailable) {
+        lines.push(rows.muted('Metrics unavailable; retrying...'));
+      } else {
+        lines.push(rows.muted('Connecting to server...'));
+        lines.push(rows.muted('Gathering metrics...'));
+      }
       while (lines.length < height - 1) {
         lines.push(rows.row(''));
       }

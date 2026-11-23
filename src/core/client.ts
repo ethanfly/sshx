@@ -91,40 +91,47 @@ export class SSHConnection {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
 
-      const onError = (err: Error) => {
+      const rejectBeforeReady = (err: Error) => {
         if (!settled) {
           settled = true;
-          this.cleanup();
+          this.client.removeListener('ready', onReady);
           reject(err);
         }
       };
 
-      this.client.once('error', onError);
-
-      this.client.once('ready', () => {
-        if (!settled) {
-          settled = true;
-          this.isConnected = true;
-          this.client.removeListener('error', onError);
-          this.setupKeepalive();
-          this.configManager.recordConnection(this.profile.id);
-          resolve();
-        }
-      });
-
-      this.client.once('close', () => {
-        this.isConnected = false;
+      const onError = (err: Error) => {
         this.cleanup();
-      });
+        rejectBeforeReady(err);
+      };
+
+      const onReady = () => {
+        settled = true;
+        this.isConnected = true;
+        this.setupKeepalive();
+        try {
+          this.configManager.recordConnection(this.profile.id);
+        } catch {
+          process.emitWarning('Could not record the last SSH connection', { code: 'SSHX_CONNECTION_HISTORY' });
+        }
+        resolve();
+      };
+
+      const onClose = () => {
+        this.client.removeListener('error', onError);
+        this.cleanup();
+        if (!settled) rejectBeforeReady(new Error('SSH connection closed before authentication completed'));
+      };
+
+      this.client.on('error', onError);
+      this.client.once('ready', onReady);
+      this.client.once('close', onClose);
 
       try {
         this.client.connect(connectConfig);
       } catch (err) {
-        if (!settled) {
-          settled = true;
-          this.cleanup();
-          reject(err);
-        }
+        this.client.removeListener('error', onError);
+        this.client.removeListener('close', onClose);
+        onError(err instanceof Error ? err : new Error(String(err)));
       }
     });
   }

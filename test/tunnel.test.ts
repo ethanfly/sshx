@@ -1,16 +1,24 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { EventEmitter, once } from 'node:events';
 import net from 'node:net';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { Duplex, PassThrough } from 'node:stream';
+import { text } from 'node:stream/consumers';
+import { fileURLToPath } from 'node:url';
+import type { Client } from 'ssh2';
+import ssh2 from 'ssh2';
 import { SocksClient } from 'socks';
 import {
   ConfigManager,
   KnownHostsManager,
   SSHConnection,
-  TunnelManager
+  TunnelManager,
+  parsePortForwardString
 } from '../dist/index.js';
 import { MockSSHServer } from './mock-server.ts';
 
@@ -170,4 +178,118 @@ test('Tunnel: Local Port Forwarding (-L)', async () => {
   await localTunnel.stop();
   assert.equal(localTunnel.isRunning(), false);
   conn.disconnect();
+});
+
+test('Tunnel: parses remote bind and local target in both -R forms', () => {
+  const { id: _defaultID, ...defaultBind } = parsePortForwardString('9000:localhost:3000', 'remote');
+  const { id: _explicitID, ...explicitBind } = parsePortForwardString('192.0.2.10:9000:localhost:3000', 'remote');
+  assert.deepEqual(defaultBind, {
+    type: 'remote',
+    remoteHost: '127.0.0.1',
+    remotePort: 9000,
+    localHost: 'localhost',
+    localPort: 3000
+  });
+  assert.deepEqual(explicitBind, { ...defaultBind, remoteHost: '192.0.2.10' });
+});
+
+test('Tunnel: Remote Port Forwarding (-R) connects to the local target', { timeout: 5000 }, async (context) => {
+  const bindPort = targetHttpPort === 9000 ? 9001 : 9000;
+  const bindHost = '127.0.0.1';
+  const client = Object.assign(new EventEmitter(), {
+    forwardIn(host: string, port: number, callback: () => void) {
+      assert.equal(host, bindHost);
+      assert.equal(port, bindPort);
+      callback();
+    },
+    unforwardIn(host: string, port: number, callback: () => void) {
+      assert.equal(host, bindHost);
+      assert.equal(port, bindPort);
+      callback();
+    }
+  });
+
+  const manager = new TunnelManager(client as unknown as Client);
+  const config = parsePortForwardString(`${bindPort}:${bindHost}:${targetHttpPort}`, 'remote');
+  const tunnel = await manager.addTunnel(config);
+  await tunnel.start();
+  context.after(() => tunnel.stop());
+
+  const request = new PassThrough();
+  const response = new PassThrough();
+  const channel = Duplex.from({ readable: request, writable: response });
+  context.after(() => { channel.destroy(); });
+
+  client.emit('tcp connection', { destIP: bindHost, destPort: bindPort }, () => channel);
+  const pending = text(response);
+  request.write('GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+  assert.match(await pending, /TUNNEL_SUCCESS/);
+});
+
+test('Tunnel CLI releases its listener on SSH connection close', { timeout: 8000 }, async (context) => {
+  const sshServer = new ssh2.Server({ hostKeys: [mockServer.hostKeyPem] });
+  const connectionArrival = once(sshServer, 'connection');
+  sshServer.on('connection', (connection) => {
+    connection.on('authentication', (auth) => {
+      if (auth.method === 'password' && auth.username === mockServer.username && auth.password === mockServer.password) {
+        auth.accept();
+      } else {
+        auth.reject(['password']);
+      }
+    });
+  });
+  const sshListening = once(sshServer, 'listening');
+  sshServer.listen(0, '127.0.0.1');
+  context.after(() => { sshServer.close(); });
+  await sshListening;
+
+  const portProbe = net.createServer();
+  const probeListening = once(portProbe, 'listening');
+  portProbe.listen(0, '127.0.0.1');
+  await probeListening;
+  const localPort = (portProbe.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => { portProbe.close(() => resolve()); });
+
+  const sshListenPort = (sshServer.address() as net.AddressInfo).port;
+  const cliPath = fileURLToPath(new URL('../bin/sshx.js', import.meta.url));
+  const cli = spawn(process.execPath, [
+    cliPath, 'tunnel', `${mockServer.username}@127.0.0.1`, '-p', String(sshListenPort),
+    '-L', `${localPort}:127.0.0.1:${targetHttpPort}`
+  ], {
+    env: {
+      ...process.env,
+      HOME: tempConfigDir,
+      USERPROFILE: tempConfigDir,
+      SSHX_CONFIG_DIR: tempConfigDir,
+      SSH_PASSWORD: mockServer.password
+    },
+    signal: context.signal
+  });
+  const cliClosed = once(cli, 'close');
+  const diagnostics = text(cli.stderr);
+  const ready = (async () => {
+    let stdout = '';
+    for await (const chunk of cli.stdout) {
+      stdout += chunk.toString();
+      if (stdout.includes('Tunnels active')) return true;
+    }
+    return false;
+  })();
+  const [connection] = await connectionArrival;
+  try {
+    assert.equal(await ready, true);
+  } finally {
+    connection.end();
+  }
+
+  const [exitCode, signal] = await cliClosed;
+  assert.equal(signal, null);
+  assert.equal(exitCode, 1);
+  assert.match(await diagnostics, /SSH connection closed unexpectedly/);
+
+  const rebind = net.createServer();
+  const listening = once(rebind, 'listening');
+  rebind.listen(localPort, '127.0.0.1');
+  context.after(() => { rebind.close(); });
+  await listening;
 });

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { defaultConfigManager, HostProfile, resolvePortablePath } from '../core/config.js';
+import { defaultConfigManager, DuplicateHostError, HostProfile, resolvePortablePath } from '../core/config.js';
 import { SSHConnection } from '../core/client.js';
 import { colors, prompt, renderTable } from './utils.js';
 
@@ -50,11 +50,16 @@ export async function runHostList(options: HostListCliOptions = {}): Promise<voi
   process.stdout.write(renderTable(['Name', 'Address', 'Auth', 'Tags', 'Last Connected'], rows) + '\n');
 }
 
-export interface HostAddCliOptions extends Partial<HostProfile> {
-  user?: string;
+export interface HostAddCliOptions extends HostEditCliOptions {
   yes?: boolean;
   force?: boolean;
-  identity?: string;
+}
+
+function parseAuthType(value?: string): HostProfile['authType'] | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'key') return 'privateKey';
+  if (value === 'password' || value === 'privateKey' || value === 'agent' || value === 'keyboard-interactive') return value;
+  throw new Error('Invalid authentication method: expected key, password, agent or keyboard-interactive.');
 }
 
 export async function runHostAdd(options: HostAddCliOptions = {}): Promise<void> {
@@ -64,11 +69,12 @@ export async function runHostAdd(options: HostAddCliOptions = {}): Promise<void>
   let host = options.host;
   let username = options.username || options.user;
   let port = options.port !== undefined ? Number(options.port) : undefined;
-  let authType = options.authType;
+  let authType = parseAuthType(options.authType ?? options.auth);
   let password = options.password;
-  let privateKeyPath = options.privateKeyPath || options.identity;
+  let privateKeyPath = options.privateKeyPath ?? options.identity ?? options.key;
   let tags = options.tags;
   let notes = options.notes;
+  let overwrite = options.force ?? false;
 
   if (isInteractive) {
     process.stdout.write(`${colors.bold}${colors.cyan}=== Add New SSH Host Profile ===${colors.reset}\n`);
@@ -78,72 +84,82 @@ export async function runHostAdd(options: HostAddCliOptions = {}): Promise<void>
       name = await prompt(`${colors.bold}Profile Name:${colors.reset} `);
     }
 
+    const existing = defaultConfigManager.getHostByName(name);
+    if (existing && !overwrite) {
+      const answer = await prompt(`${colors.yellow}Host '${existing.name}' already exists. Overwrite? [y/N]: ${colors.reset}`);
+      overwrite = ['y', 'yes'].includes(answer.trim().toLowerCase());
+      if (!overwrite) {
+        process.stdout.write(`${colors.dim}Operation cancelled.${colors.reset}\n`);
+        return;
+      }
+    }
+
     host = await prompt(`${colors.bold}Hostname or IP:${colors.reset} `);
     while (!host) {
       process.stdout.write(`${colors.red}Hostname or IP is required.${colors.reset}\n`);
       host = await prompt(`${colors.bold}Hostname or IP:${colors.reset} `);
     }
 
-    const userAns = await prompt(`${colors.bold}Username (default: root):${colors.reset} `);
-    username = userAns.trim() || 'root';
+    const userAns = await prompt(`${colors.bold}Username (default: ${existing?.username ?? 'root'}):${colors.reset} `);
+    username = userAns.trim() || username;
 
-    const portAns = await prompt(`${colors.bold}Port (default: 22):${colors.reset} `);
-    port = parseInt(portAns, 10) || 22;
+    const portAns = await prompt(`${colors.bold}Port (default: ${existing?.port ?? 22}):${colors.reset} `);
+    if (portAns.trim()) port = Number(portAns);
 
-    const authChoice = await prompt(`${colors.bold}Auth method [1=Key, 2=Password] (default: 1):${colors.reset} `);
-    authType = authChoice.trim() === '2' ? 'password' : 'privateKey';
+    const sameEndpoint = existing && host === existing.host &&
+      (username ?? existing.username) === existing.username && (port ?? existing.port) === existing.port;
+    const authDefault = authType ?? (sameEndpoint ? existing.authType : 'privateKey');
+    const authChoice = await prompt(`${colors.bold}Auth method [1=Key, 2=Password] (default: ${authDefault}):${colors.reset} `);
+    authType = authChoice.trim() === '2' ? 'password' : authChoice.trim() === '1' ? 'privateKey' : authDefault;
 
     if (authType === 'password') {
-      password = await prompt(`${colors.bold}Password:${colors.reset} `, true);
-    } else {
-      const keyAns = await prompt(`${colors.bold}Private key path (default: ~/.ssh/id_ed25519):${colors.reset} `);
-      privateKeyPath = keyAns.trim() || '~/.ssh/id_ed25519';
+      const passwordAns = await prompt(`${colors.bold}Password:${colors.reset} `, true);
+      password = passwordAns || password;
+    } else if (authType === 'privateKey') {
+      const keyDefault = privateKeyPath ?? (sameEndpoint ? existing.privateKeyPath : undefined) ?? '~/.ssh/id_ed25519';
+      const keyAns = await prompt(`${colors.bold}Private key path (default: ${keyDefault}):${colors.reset} `);
+      privateKeyPath = keyAns.trim() || privateKeyPath || (sameEndpoint && existing.privateKey ? undefined : keyDefault);
     }
 
     const tagsAns = await prompt(`${colors.bold}Tags (comma separated, e.g. prod,aws):${colors.reset} `);
-    tags = tagsAns.split(',').map(s => s.trim()).filter(Boolean);
+    if (tagsAns.trim()) tags = tagsAns.split(',').map(s => s.trim()).filter(Boolean);
 
     const notesAns = await prompt(`${colors.bold}Notes (optional):${colors.reset} `);
-    notes = notesAns.trim() || undefined;
+    notes = notesAns.trim() || notes;
   } else {
-    // Non-interactive fallback
     if (!name || !host) {
       process.stderr.write(`${colors.red}Error: Both --name and --host must be specified.${colors.reset}\n`);
       process.exit(1);
     }
-    username = username || 'root';
-    port = port !== undefined ? Number(port) : 22;
-    authType = authType || (password ? 'password' : (privateKeyPath ? 'privateKey' : 'password'));
+    authType ??= password ? 'password' : privateKeyPath ? 'privateKey' : undefined;
   }
 
-  // Check if profile with same name already exists
-  const existing = defaultConfigManager.getHost(name);
-  if (existing && !options.force && isInteractive) {
-    const overwrite = await prompt(`${colors.yellow}Host '${name}' already exists. Overwrite? [y/N]: ${colors.reset}`);
-    if (overwrite.toLowerCase() !== 'y' && overwrite.toLowerCase() !== 'yes') {
-      process.stdout.write(`${colors.dim}Operation cancelled.${colors.reset}\n`);
-      return;
-    }
+  try {
+    const newProfile = defaultConfigManager.addHost({
+      name,
+      host,
+      username,
+      port,
+      authType,
+      password,
+      privateKeyPath,
+      proxyJump: options.proxyJump ?? options.jump,
+      tags,
+      notes
+    }, { overwrite });
+    process.stdout.write(`${colors.green}✓ Saved host profile '${newProfile.name}' (${newProfile.id})${colors.reset}\n`);
+  } catch (error) {
+    if (!(error instanceof DuplicateHostError)) throw error;
+    process.stderr.write(`${colors.red}${error.message} Use --force to overwrite or use 'sshx host edit'.${colors.reset}\n`);
+    process.exitCode = 1;
   }
-
-  const newProfile = defaultConfigManager.addHost({
-    name,
-    host,
-    username,
-    port,
-    authType,
-    password,
-    privateKeyPath,
-    tags: tags || [],
-    notes
-  });
-
-  process.stdout.write(`${colors.green}✓ Saved host profile '${newProfile.name}' (${newProfile.id})${colors.reset}\n`);
 }
 
 export interface HostEditCliOptions extends Partial<HostProfile> {
   user?: string;
   identity?: string;
+  key?: string;
+  auth?: string;
   jump?: string;
 }
 
@@ -175,11 +191,14 @@ export async function runHostEdit(idOrName: string, options: HostEditCliOptions 
     options.username !== undefined ||
     options.user !== undefined ||
     options.authType !== undefined ||
+    options.auth !== undefined ||
     options.password !== undefined ||
     options.privateKeyPath !== undefined ||
     options.identity !== undefined ||
+    options.key !== undefined ||
     options.tags !== undefined ||
     options.notes !== undefined ||
+    options.proxyJump !== undefined ||
     options.jump !== undefined;
 
   let updates: Partial<HostProfile> = {};
@@ -189,13 +208,13 @@ export async function runHostEdit(idOrName: string, options: HostEditCliOptions 
     if (options.host !== undefined) updates.host = options.host;
     if (options.port !== undefined) updates.port = Number(options.port);
     if (options.username !== undefined || options.user !== undefined) updates.username = options.username || options.user;
-    if (options.authType !== undefined) updates.authType = options.authType;
+    if (options.authType !== undefined || options.auth !== undefined) updates.authType = parseAuthType(options.authType ?? options.auth);
     if (options.password !== undefined) updates.password = options.password;
-    if (options.privateKeyPath !== undefined) updates.privateKeyPath = options.privateKeyPath;
-    if (options.identity !== undefined) updates.privateKeyPath = options.identity;
+    const privateKeyPath = options.privateKeyPath ?? options.identity ?? options.key;
+    if (privateKeyPath !== undefined) updates.privateKeyPath = privateKeyPath;
     if (options.tags !== undefined) updates.tags = options.tags;
     if (options.notes !== undefined) updates.notes = options.notes;
-    if (options.jump !== undefined) updates.proxyJump = options.jump;
+    if (options.proxyJump !== undefined || options.jump !== undefined) updates.proxyJump = options.proxyJump ?? options.jump;
   } else if (process.stdin.isTTY) {
     // Interactive edit wizard
     process.stdout.write(`${colors.bold}${colors.cyan}=== Edit Host Profile: ${current.name} ===${colors.reset}\n`);
@@ -234,12 +253,18 @@ export async function runHostEdit(idOrName: string, options: HostEditCliOptions 
     if (notesAns.trim()) updates.notes = notesAns.trim();
   }
 
-  const updated = defaultConfigManager.updateHost(current.id, updates);
-  if (updated) {
-    process.stdout.write(`${colors.green}✓ Successfully updated host profile '${updated.name}' (${updated.id})${colors.reset}\n`);
-  } else {
-    process.stderr.write(`${colors.red}Failed to update host profile.${colors.reset}\n`);
-    process.exit(1);
+  try {
+    const updated = defaultConfigManager.updateHost(current.id, updates);
+    if (updated) {
+      process.stdout.write(`${colors.green}✓ Successfully updated host profile '${updated.name}' (${updated.id})${colors.reset}\n`);
+    } else {
+      process.stderr.write(`${colors.red}Failed to update host profile.${colors.reset}\n`);
+      process.exitCode = 1;
+    }
+  } catch (error) {
+    if (!(error instanceof DuplicateHostError)) throw error;
+    process.stderr.write(`${colors.red}${error.message}${colors.reset}\n`);
+    process.exitCode = 1;
   }
 }
 

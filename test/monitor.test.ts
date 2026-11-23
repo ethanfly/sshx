@@ -1,8 +1,135 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { MetricsCollector } from '../dist/core/metrics.js';
+import { EventEmitter } from 'node:events';
+import { MetricsCollector, type ServerMetrics } from '../dist/core/metrics.js';
+import { SplitSession } from '../dist/core/split-session.js';
 import { SidebarRenderer, defaultSidebarTheme } from '../dist/tui/sidebar.js';
 import { padClip, stringWidth } from '../dist/tui/screen.js';
+
+function mockChannel() {
+  return Object.assign(new EventEmitter(), {
+    stderr: new EventEmitter(),
+    setWindow() {},
+    write() {}
+  });
+}
+
+function flushPoll() {
+  return new Promise<void>(resolve => setImmediate(resolve));
+}
+
+test('MetricsCollector: rejected probes are non-fatal and stale samples are discarded', async (context) => {
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  const requests: ((error?: Error, channel?: ReturnType<typeof mockChannel>) => void)[] = [];
+  const collector = new MetricsCollector({
+    exec(_command: string, _options: unknown, callback: typeof requests[number]) {
+      requests.push(callback);
+    }
+  } as any, 25);
+  const updated = context.mock.fn();
+  collector.on('update', updated);
+
+  function completeSample(callback: typeof requests[number], hostname: string) {
+    const channel = mockChannel();
+    callback(undefined, channel);
+    channel.emit('data', Buffer.from(`HOST=${hostname}\n`));
+    channel.emit('exit', 0);
+    channel.emit('close');
+  }
+
+  try {
+    collector.start();
+    requests.shift()!(new Error('metrics unavailable'));
+    await flushPoll();
+
+    context.mock.timers.tick(25);
+    const staleRequest = requests.shift()!;
+    collector.stop();
+    collector.start();
+    completeSample(staleRequest, 'stale');
+    await flushPoll();
+    assert.strictEqual(updated.mock.callCount(), 0);
+
+    context.mock.timers.tick(25);
+    completeSample(requests.shift()!, 'current');
+    await flushPoll();
+    assert.strictEqual(updated.mock.callCount(), 1);
+    assert.strictEqual(collector.getLatest()?.hostname, 'current');
+  } finally {
+    collector.stop();
+  }
+});
+
+test('SplitSession: sidebar polling follows visibility and stops at session close', async (context) => {
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  const input = Object.assign(new EventEmitter(), { isTTY: true, setRawMode() {}, pause() {}, resume() {} });
+  const write = context.mock.fn((_text: string) => true);
+  const output = Object.assign(new EventEmitter(), { isTTY: true, columns: 110, rows: 30, write });
+  context.mock.getter(process, 'stdin', () => input as unknown as typeof process.stdin);
+  context.mock.getter(process, 'stdout', () => output as unknown as typeof process.stdout);
+  const channel = mockChannel();
+  const exec = context.mock.fn((_command, _options, callback) => callback(new Error('metrics unavailable')));
+  const session = new SplitSession({
+    exec,
+    shell(_options: unknown, callback: (error: undefined, channel: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any, { enableSidebar: false });
+
+  await session.start();
+  try {
+    session.attachToLocalProcess();
+    assert.strictEqual(exec.mock.callCount(), 0);
+
+    input.emit('data', Buffer.from('\x1b[12~'));
+    assert.strictEqual(exec.mock.callCount(), 1);
+    await flushPoll();
+    assert.ok(write.mock.calls.some(call => call.arguments[0].includes('Metrics unavailable')));
+    context.mock.timers.tick(2500);
+    assert.strictEqual(exec.mock.callCount(), 2);
+
+    output.columns = 80;
+    output.emit('resize');
+    await flushPoll();
+    context.mock.timers.tick(5000);
+    assert.strictEqual(exec.mock.callCount(), 2);
+
+    input.emit('data', Buffer.from('\x0f'));
+    assert.strictEqual(exec.mock.callCount(), 3);
+  } finally {
+    channel.emit('close');
+  }
+  await flushPoll();
+  context.mock.timers.tick(5000);
+  assert.strictEqual(exec.mock.callCount(), 3);
+});
+
+test('SplitSession: redirected output disables sidebar polling and leaves hotkeys as input', async (context) => {
+  const input = Object.assign(new EventEmitter(), { isTTY: true, setRawMode() {}, pause() {}, resume() {} });
+  const output = Object.assign(new EventEmitter(), { isTTY: false, columns: 110, rows: 30, write() {} });
+  context.mock.getter(process, 'stdin', () => input as unknown as typeof process.stdin);
+  context.mock.getter(process, 'stdout', () => output as unknown as typeof process.stdout);
+  const channel = mockChannel();
+  const write = context.mock.method(channel, 'write');
+  const exec = context.mock.fn();
+  const session = new SplitSession({
+    exec,
+    shell(_options: unknown, callback: (error: undefined, channel: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any, { enableSidebar: true });
+
+  await session.start();
+  try {
+    session.attachToLocalProcess();
+    const hotkey = Buffer.from('\x0f');
+    input.emit('data', hotkey);
+    assert.strictEqual(exec.mock.callCount(), 0);
+    assert.deepStrictEqual(write.mock.calls[0].arguments, [hotkey]);
+  } finally {
+    channel.emit('close');
+  }
+});
 
 test('MetricsCollector: parses raw shell metrics output into structured ServerMetrics', () => {
   const rawOutput = `
