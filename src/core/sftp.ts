@@ -67,26 +67,32 @@ export class SFTPClient {
     return new Promise<RemoteFileInfo[]>((resolve, reject) => {
       sftp.readdir(remotePath, (err, list) => {
         if (err) return reject(err);
+        let results: RemoteFileInfo[];
+        try {
+          results = list.map((item) => {
+            validateRemoteName(item.filename);
+            const mode = item.attrs.mode || 0;
+            const isDir = (mode & 0o170000) === 0o040000;
+            const isSymlink = (mode & 0o170000) === 0o120000;
+            const isFile = (mode & 0o170000) === 0o100000 || (!isDir && !isSymlink);
 
-        const results: RemoteFileInfo[] = list.map((item) => {
-          const mode = item.attrs.mode || 0;
-          const isDir = (mode & 0o170000) === 0o040000;
-          const isSymlink = (mode & 0o170000) === 0o120000;
-          const isFile = (mode & 0o170000) === 0o100000 || (!isDir && !isSymlink);
-
-          return {
-            filename: item.filename,
-            path: path.posix.join(remotePath, item.filename),
-            isDirectory: isDir,
-            isFile,
-            isSymbolicLink: isSymlink,
-            size: item.attrs.size || 0,
-            modifyTime: new Date((item.attrs.mtime || 0) * 1000),
-            accessTime: new Date((item.attrs.atime || 0) * 1000),
-            permissions: mode & 0o777,
-            modeString: formatModeString(mode)
-          };
-        });
+            return {
+              filename: item.filename,
+              path: path.posix.join(remotePath, item.filename),
+              isDirectory: isDir,
+              isFile,
+              isSymbolicLink: isSymlink,
+              size: item.attrs.size || 0,
+              modifyTime: new Date((item.attrs.mtime || 0) * 1000),
+              accessTime: new Date((item.attrs.atime || 0) * 1000),
+              permissions: mode & 0o777,
+              modeString: formatModeString(mode)
+            };
+          });
+        } catch (error) {
+          reject(error);
+          return;
+        }
 
         // Sort directories first, then alphabetical
         results.sort((a, b) => {
@@ -183,8 +189,10 @@ export class SFTPClient {
     remotePath: string,
     onProgress?: ProgressCallback
   ): Promise<void> {
+    const stat = fs.lstatSync(localPath);
+    if (stat.isSymbolicLink()) throw new Error(`Cannot upload a symbolic link: ${localPath}`);
+    if (!stat.isFile()) throw new Error(`Local path is not a regular file: ${localPath}`);
     const sftp = await this.getWrapper();
-    const stat = fs.statSync(localPath);
     const totalBytes = stat.size;
     let bytesTransferred = 0;
     const startTime = Date.now();
@@ -206,14 +214,18 @@ export class SFTPClient {
       readStream.on('data', (chunk: Buffer) => {
         bytesTransferred += chunk.length;
         if (onProgress) {
-          const elapsedSec = (Date.now() - startTime) / 1000 || 0.001;
-          onProgress({
-            bytesTransferred,
-            totalBytes,
-            percent: totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100,
-            speedBps: Math.round(bytesTransferred / elapsedSec),
-            currentFile: path.basename(localPath)
-          });
+          try {
+            const elapsedSec = (Date.now() - startTime) / 1000 || 0.001;
+            onProgress({
+              bytesTransferred,
+              totalBytes,
+              percent: totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100,
+              speedBps: Math.round(bytesTransferred / elapsedSec),
+              currentFile: path.basename(localPath)
+            });
+          } catch (error) {
+            finish(error instanceof Error ? error : new Error(String(error)));
+          }
         }
       });
 
@@ -307,9 +319,7 @@ export class SFTPClient {
     const startTime = Date.now();
 
     const localDir = path.dirname(path.resolve(localPath));
-    if (!fs.existsSync(localDir)) {
-      fs.mkdirSync(localDir, { recursive: true });
-    }
+    ensureLocalDirectory(localDir);
 
     const temporaryPath = path.join(localDir, `.${path.basename(localPath)}.sshx-${randomUUID()}.tmp`);
     try {
@@ -318,14 +328,18 @@ export class SFTPClient {
       readStream.on('data', (chunk: Buffer) => {
         bytesTransferred += chunk.length;
         if (onProgress) {
-          const elapsedSec = (Date.now() - startTime) / 1000 || 0.001;
-          onProgress({
-            bytesTransferred,
-            totalBytes,
-            percent: totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100,
-            speedBps: Math.round(bytesTransferred / elapsedSec),
-            currentFile: path.posix.basename(remotePath)
-          });
+          try {
+            const elapsedSec = (Date.now() - startTime) / 1000 || 0.001;
+            onProgress({
+              bytesTransferred,
+              totalBytes,
+              percent: totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100,
+              speedBps: Math.round(bytesTransferred / elapsedSec),
+              currentFile: path.posix.basename(remotePath)
+            });
+          } catch (error) {
+            readStream.destroy(error instanceof Error ? error : new Error(String(error)));
+          }
         }
       });
       await pipeline(readStream, writeStream);
@@ -361,8 +375,9 @@ export class SFTPClient {
     for (const part of parts) {
       current = path.posix.join(current, part);
       try {
-        const entry = await this.stat(current);
-        if (!entry.isDirectory) throw new Error(`Remote path is not a directory: ${current}`);
+        const type = await this.remoteFileType(current);
+        if (type === fs.constants.S_IFLNK) throw new Error(`Cannot upload through a symbolic link: ${current}`);
+        if (type !== fs.constants.S_IFDIR) throw new Error(`Remote path is not a directory: ${current}`);
         continue;
       } catch (error) {
         if (!isMissingFile(error)) throw error;
@@ -373,7 +388,7 @@ export class SFTPClient {
         });
       } catch (error) {
         if ((error as { code?: number }).code !== 4) throw error;
-        const createdByAnotherClient = await this.stat(current).then(entry => entry.isDirectory, () => false);
+        const createdByAnotherClient = await this.remoteFileType(current).then(type => type === fs.constants.S_IFDIR, () => false);
         if (createdByAnotherClient) continue;
         throw error;
       }
@@ -384,6 +399,13 @@ export class SFTPClient {
    * Delete remote file or directory (supports recursive rm -rf)
    */
   public async rm(remotePath: string, recursive: boolean = true): Promise<void> {
+    if (recursive) {
+      const segments = remotePath.split('/').filter(Boolean);
+      const normalized = path.posix.normalize(remotePath);
+      if (!remotePath.trim() || segments.includes('..') || normalized === '/' || normalized === '.' || normalized === './' || normalized === '..') {
+        throw new Error(`Unsafe recursive SFTP removal path: ${remotePath}`);
+      }
+    }
     const sftp = await this.getWrapper();
     const entryPath = remotePath.replace(/\/+$/, '') || remotePath;
     const fileType = await new Promise<number>((resolve, reject) => {
@@ -472,18 +494,25 @@ export class SFTPClient {
     remoteDir: string,
     onProgress?: ProgressCallback
   ): Promise<void> {
+    const source = fs.lstatSync(localDir);
+    if (source.isSymbolicLink()) throw new Error(`Cannot upload a symbolic link: ${localDir}`);
+    if (!source.isDirectory()) throw new Error(`Local path is not a directory: ${localDir}`);
     await this.mkdir(remoteDir, true);
     const items = fs.readdirSync(localDir);
 
     for (const item of items) {
       const localItemPath = path.join(localDir, item);
       const remoteItemPath = path.posix.join(remoteDir, item);
-      const stat = fs.statSync(localItemPath);
+      const stat = fs.lstatSync(localItemPath);
 
-      if (stat.isDirectory()) {
+      if (stat.isSymbolicLink()) {
+        throw new Error(`Cannot upload a symbolic link: ${localItemPath}`);
+      } else if (stat.isDirectory()) {
         await this.uploadDir(localItemPath, remoteItemPath, onProgress);
-      } else {
+      } else if (stat.isFile()) {
         await this.uploadFile(localItemPath, remoteItemPath, onProgress);
+      } else {
+        throw new Error(`Cannot upload a non-file entry: ${localItemPath}`);
       }
     }
   }
@@ -496,21 +525,71 @@ export class SFTPClient {
     localDir: string,
     onProgress?: ProgressCallback
   ): Promise<void> {
-    if (!fs.existsSync(localDir)) {
-      fs.mkdirSync(localDir, { recursive: true });
-    }
+    const remoteType = await this.remoteFileType(remoteDir);
+    if (remoteType === fs.constants.S_IFLNK) throw new Error(`Cannot download a symbolic link: ${remoteDir}`);
+    if (remoteType !== fs.constants.S_IFDIR) throw new Error(`Remote path is not a directory: ${remoteDir}`);
+    ensureLocalDirectory(localDir);
+    await this.downloadDirectoryEntries(remoteDir, localDir, onProgress);
+  }
 
+  private async downloadDirectoryEntries(remoteDir: string, localDir: string, onProgress?: ProgressCallback): Promise<void> {
     const items = await this.list(remoteDir);
     for (const item of items) {
       if (item.filename === '.' || item.filename === '..') continue;
+      const entryType = await this.remoteFileType(item.path);
+      if (entryType === fs.constants.S_IFLNK) throw new Error(`Cannot download a symbolic link: ${item.path}`);
       const localItemPath = path.join(localDir, item.filename);
 
-      if (item.isDirectory) {
-        await this.downloadDir(item.path, localItemPath, onProgress);
-      } else {
+      if (entryType === fs.constants.S_IFDIR) {
+        ensureLocalDirectory(localItemPath);
+        await this.downloadDirectoryEntries(item.path, localItemPath, onProgress);
+      } else if (entryType === fs.constants.S_IFREG) {
         await this.downloadFile(item.path, localItemPath, onProgress);
+      } else {
+        throw new Error(`Cannot download a non-file entry: ${item.path}`);
       }
     }
+  }
+
+  private async remoteFileType(remotePath: string): Promise<number> {
+    const sftp = await this.getWrapper();
+    return new Promise<number>((resolve, reject) => {
+      sftp.lstat(remotePath, (error, stats) => error ? reject(error) : resolve(stats.mode & fs.constants.S_IFMT));
+    });
+  }
+}
+
+function validateRemoteName(name: string): void {
+  if (!name || name.includes('/') || name.includes('\\') || name.includes('\0') || /^[a-zA-Z]:/.test(name)) {
+    throw new Error(`Invalid remote entry name: ${JSON.stringify(name)}`);
+  }
+}
+
+function ensureLocalDirectory(directory: string): void {
+  const missing: string[] = [];
+  let current = path.resolve(directory);
+  while (true) {
+    try {
+      const stats = fs.lstatSync(current);
+      if (stats.isSymbolicLink()) throw new Error(`Cannot download through a symbolic link: ${current}`);
+      if (!stats.isDirectory()) throw new Error(`Local path is not a directory: ${current}`);
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
+      missing.push(current);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  for (const next of missing.reverse()) {
+    try {
+      fs.mkdirSync(next);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    const stats = fs.lstatSync(next);
+    if (stats.isSymbolicLink()) throw new Error(`Cannot download through a symbolic link: ${next}`);
+    if (!stats.isDirectory()) throw new Error(`Local path is not a directory: ${next}`);
   }
 }
 

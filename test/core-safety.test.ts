@@ -69,6 +69,9 @@ test('SFTP exists propagates permission errors and mkdir never hides a failed cr
     stat(_remotePath, callback) {
       callback(status, undefined as never);
     },
+    lstat(_remotePath, callback) {
+      callback(status, undefined as never);
+    },
     mkdir(_remotePath, callback) {
       mkdirCalls++;
       callback(Object.assign(new Error('failed'), { code: 4 }));
@@ -83,6 +86,20 @@ test('SFTP exists propagates permission errors and mkdir never hides a failed cr
   assert.equal(await sftp.exists('/missing'), false);
   await assert.rejects(sftp.mkdir('/missing'), /failed/);
   assert.equal(mkdirCalls, 1);
+});
+
+test('SFTP recursive mkdir refuses remote symbolic-link directory components', async () => {
+  const calls: string[] = [];
+  const sftp = makeSftpClient({
+    lstat(remotePath, callback) {
+      calls.push(`lstat ${remotePath}`);
+      const mode = remotePath === '/linked' ? fsConstants.S_IFLNK : fsConstants.S_IFDIR;
+      callback(undefined, { mode } as Parameters<typeof callback>[1]);
+    },
+    mkdir() { assert.fail('must not create files inside a symlinked directory'); }
+  });
+  await assert.rejects(sftp.mkdir('/linked/subdir'), /symbolic link/i);
+  assert.deepEqual(calls, ['lstat /linked']);
 });
 
 test('SFTP download preserves an existing file and removes incomplete temporary data', async () => {
@@ -109,6 +126,29 @@ test('SFTP download preserves an existing file and removes incomplete temporary 
   }
 });
 
+test('SFTP download preserves its destination when the progress callback throws', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-download-progress-'));
+  const destination = path.join(directory, 'target.txt');
+  fs.writeFileSync(destination, 'original');
+  const sftp = makeSftpClient({
+    stat(_remotePath, callback) {
+      callback(undefined, { mode: fsConstants.S_IFREG, size: 4 } as Parameters<typeof callback>[1]);
+    },
+    createReadStream() {
+      return Readable.from([Buffer.from('data')]) as ReturnType<SFTPWrapper['createReadStream']>;
+    }
+  });
+  try {
+    await assert.rejects(sftp.downloadFile('/remote', destination, () => {
+      throw new Error('progress failed');
+    }), /progress failed/);
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'original');
+    assert.deepEqual(fs.readdirSync(directory), ['target.txt']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('SFTP upload rejects write errors rather than reporting a successful transfer', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-upload-error-'));
   const source = path.join(directory, 'source.txt');
@@ -127,6 +167,31 @@ test('SFTP upload rejects write errors rather than reporting a successful transf
       }
     });
     await assert.rejects(sftp.uploadFile(source, '/remote'), /remote disk full/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP upload cleans up its temporary file when the progress callback throws', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-upload-progress-'));
+  const source = path.join(directory, 'source.txt');
+  fs.writeFileSync(source, 'some data');
+  const removed: string[] = [];
+  const sftp = makeSftpClient({
+    createWriteStream() {
+      return new Writable({ write(_chunk, _encoding, callback) { callback(); } }) as ReturnType<SFTPWrapper['createWriteStream']>;
+    },
+    unlink(remotePath, callback) {
+      removed.push(remotePath);
+      callback();
+    }
+  });
+  try {
+    await assert.rejects(sftp.uploadFile(source, '/remote.txt', () => {
+      throw new Error('progress failed');
+    }), /progress failed/);
+    assert.equal(removed.length, 1);
+    assert.match(removed[0], /^\/\.remote\.txt\.sshx-.*\.tmp$/);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -333,6 +398,16 @@ test('SFTP rm unlinks a symlink without listing or statting its target', async (
   }
 });
 
+test('SFTP recursive rm rejects root, current directory, and parent traversal', async () => {
+  const sftp = makeSftpClient({
+    lstat() { assert.fail('unsafe recursive deletion must stop before remote access'); },
+    readdir() { assert.fail('unsafe recursive deletion must not traverse'); }
+  });
+  for (const remotePath of ['/', '//', '/tmp/..', '.', './', '..', 'folder/../other']) {
+    await assert.rejects(sftp.rm(remotePath, true), /unsafe recursive SFTP removal/i);
+  }
+});
+
 test('SFTP recursive rm checks each entry with lstat before removal', async () => {
   const calls: string[] = [];
   const sftp = makeSftpClient({
@@ -360,6 +435,155 @@ test('SFTP recursive rm checks each entry with lstat before removal', async () =
 
   await sftp.rm('/tree', true);
   assert.deepEqual(calls, ['lstat /tree', 'readdir /tree', 'lstat /tree/entry', 'unlink /tree/entry', 'rmdir /tree']);
+});
+
+test('SFTP recursive upload refuses symbolic links instead of following local files or cycles', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-upload-link-'));
+  const source = path.join(directory, 'source');
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(directory, 'private.txt'), 'not for upload');
+  fs.symlinkSync(path.join(directory, 'private.txt'), path.join(source, 'linked.txt'));
+  const uploaded: string[] = [];
+  const sftp = makeSftpClient({});
+  sftp.mkdir = async () => {};
+  sftp.uploadFile = async localPath => { uploaded.push(localPath); };
+  try {
+    await assert.rejects(sftp.uploadDir(source, '/remote'), /symbolic link/i);
+    assert.deepEqual(uploaded, []);
+    const linkedDirectory = path.join(directory, 'linked-dir');
+    fs.symlinkSync(source, linkedDirectory, 'dir');
+    await assert.rejects(sftp.uploadDir(linkedDirectory, '/remote'), /symbolic link/i);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP single-file upload rejects symlinks and special files before writing remotely', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-upload-file-type-'));
+  const source = path.join(directory, 'private.txt');
+  fs.writeFileSync(source, 'not for upload');
+  const linked = path.join(directory, 'linked.txt');
+  fs.symlinkSync(source, linked);
+  const sftp = makeSftpClient({
+    createWriteStream() { assert.fail('must not open a remote file for symlink upload'); }
+  });
+  try {
+    await assert.rejects(sftp.uploadFile(linked, '/remote'), /symbolic link/i);
+    await assert.rejects(sftp.uploadFile(directory, '/remote'), /regular file/i);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP refuses remote names that could escape a recursive download or deletion', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-remote-name-'));
+  try {
+    for (const filename of ['../outside', '..\\outside', '/outside', 'sub/file']) {
+      const sftp = makeSftpClient({
+        readdir(_remotePath, callback) {
+          callback(undefined, [{ filename, attrs: { mode: fsConstants.S_IFREG } }] as Parameters<typeof callback>[1]);
+        },
+        unlink() { assert.fail('must not delete a path constructed from an invalid name'); },
+        lstat(_remotePath, callback) {
+          callback(undefined, { mode: fsConstants.S_IFDIR } as Parameters<typeof callback>[1]);
+        }
+      });
+      await assert.rejects(sftp.downloadDir('/remote', path.join(directory, 'download')), /invalid remote.*name/i);
+      await assert.rejects(sftp.rm('/remote', true), /invalid remote.*name/i);
+    }
+    assert.deepEqual(fs.readdirSync(directory), ['download']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP recursive download refuses a remote symlink presented as a directory', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-remote-link-'));
+  let reads = 0;
+  const sftp = makeSftpClient({
+    readdir(_remotePath, callback) {
+      reads++;
+      callback(undefined, [{ filename: 'linked', attrs: { mode: fsConstants.S_IFDIR } }] as Parameters<typeof callback>[1]);
+    },
+    lstat(_remotePath, callback) {
+      callback(undefined, { mode: _remotePath === '/remote' ? fsConstants.S_IFDIR : fsConstants.S_IFLNK } as Parameters<typeof callback>[1]);
+    }
+  });
+  try {
+    await assert.rejects(sftp.downloadDir('/remote', directory), /symbolic link/i);
+    assert.equal(reads, 1);
+    assert.deepEqual(fs.readdirSync(directory), []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP recursive download refuses existing local symlink directories', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-local-link-'));
+  const destination = path.join(directory, 'destination');
+  const outside = path.join(directory, 'outside');
+  fs.mkdirSync(destination);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(destination, 'linked'), 'dir');
+  const sftp = makeSftpClient({
+    readdir(_remotePath, callback) {
+      callback(undefined, [{ filename: 'linked', attrs: { mode: fsConstants.S_IFDIR } }] as Parameters<typeof callback>[1]);
+    },
+    lstat(_remotePath, callback) {
+      callback(undefined, { mode: fsConstants.S_IFDIR } as Parameters<typeof callback>[1]);
+    }
+  });
+  try {
+    await assert.rejects(sftp.downloadDir('/remote', destination), /symbolic link/i);
+    assert.deepEqual(fs.readdirSync(outside), []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP download refuses an existing directory beneath a symlinked ancestor', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-local-parent-link-'));
+  const outside = path.join(directory, 'outside');
+  fs.mkdirSync(path.join(outside, 'existing'), { recursive: true });
+  const alias = path.join(directory, 'alias');
+  fs.symlinkSync(outside, alias, 'dir');
+  const sftp = makeSftpClient({
+    lstat(_remotePath, callback) {
+      callback(undefined, { mode: fsConstants.S_IFDIR } as Parameters<typeof callback>[1]);
+    },
+    readdir() { assert.fail('must not read a remote directory before validating local path'); }
+  });
+  try {
+    await assert.rejects(sftp.downloadDir('/remote', path.join(alias, 'existing')), /symbolic link/i);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP recursive download copies nested regular files without extra directory stats', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-nested-download-'));
+  const file = path.join(directory, 'nested', 'message.txt');
+  const paths: string[] = [];
+  const sftp = makeSftpClient({
+    lstat(remotePath, callback) {
+      paths.push(remotePath);
+      const mode = remotePath.endsWith('.txt') ? fsConstants.S_IFREG : fsConstants.S_IFDIR;
+      callback(undefined, { mode } as Parameters<typeof callback>[1]);
+    },
+    readdir(remotePath, callback) {
+      const filename = remotePath === '/remote' ? 'nested' : 'message.txt';
+      const mode = filename === 'nested' ? fsConstants.S_IFDIR : fsConstants.S_IFREG;
+      callback(undefined, [{ filename, attrs: { mode } }] as Parameters<typeof callback>[1]);
+    }
+  });
+  sftp.downloadFile = async (_remotePath, localPath) => { fs.writeFileSync(localPath, 'hello'); };
+  try {
+    await sftp.downloadDir('/remote', directory);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'hello');
+    assert.deepEqual(paths, ['/remote', '/remote/nested', '/remote/nested/message.txt']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('SFTP rm stops when lstat does not identify the file type', async () => {
