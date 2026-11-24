@@ -73,6 +73,96 @@ test('ConfigManager: adds, retrieves, updates and deletes host profile', () => {
   assert.equal(configManager.getHost('test-server'), undefined);
 });
 
+test('ConfigManager: changing a saved endpoint clears credentials and proxy settings', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-update-endpoint-'));
+  try {
+    const manager = new ConfigManager(temporary);
+    const original = manager.addHost({
+      name: 'production',
+      host: 'old.example.test',
+      authType: 'privateKey',
+      password: 'old password',
+      privateKey: 'old key',
+      privateKeyPath: '~/.ssh/old-key',
+      passphrase: 'old passphrase',
+      proxyJump: 'old-jump',
+      proxyCommand: 'old proxy command'
+    });
+
+    const updated = manager.updateHost(original.id, { ...original, host: 'new.example.test' });
+
+    assert.ok(updated);
+    assert.equal(updated.id, original.id);
+    assert.equal(updated.host, 'new.example.test');
+    assert.equal(updated.authType, 'password');
+    assert.equal(updated.password, undefined);
+    assert.equal(updated.privateKey, undefined);
+    assert.equal(updated.privateKeyPath, undefined);
+    assert.equal(updated.passphrase, undefined);
+    assert.equal(updated.proxyJump, undefined);
+    assert.equal(updated.proxyCommand, undefined);
+
+    const newPassword = manager.updateHost(original.id, {
+      ...updated,
+      host: 'password.example.test',
+      password: 'replacement password',
+      proxyJump: 'new-jump'
+    });
+    assert.ok(newPassword);
+    assert.equal(newPassword.authType, 'password');
+    assert.equal(newPassword.password, 'replacement password');
+    assert.equal(newPassword.privateKey, undefined);
+    assert.equal(newPassword.passphrase, undefined);
+    assert.equal(newPassword.proxyJump, 'new-jump');
+
+    const reconfigured = manager.updateHost(original.id, {
+      host: 'newer.example.test',
+      username: 'new-user',
+      authType: 'privateKey',
+      privateKeyPath: '~/.ssh/new-key',
+      passphrase: 'new passphrase'
+    });
+    assert.ok(reconfigured);
+    assert.equal(reconfigured.password, undefined);
+    assert.equal(reconfigured.authType, 'privateKey');
+    assert.equal(reconfigured.privateKeyPath, '~/.ssh/new-key');
+    assert.equal(reconfigured.passphrase, 'new passphrase');
+
+    const renamed = manager.updateHost(original.id, { name: 'new production', notes: 'keep credentials' });
+    assert.ok(renamed);
+    assert.equal(renamed.privateKeyPath, '~/.ssh/new-key');
+    assert.equal(renamed.passphrase, 'new passphrase');
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('ConfigManager: exporting hosts atomically protects existing files with private permissions', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-export-hosts-'));
+  const manager = new ConfigManager(path.join(temporary, 'config'));
+  const destination = path.join(temporary, 'nested', 'hosts.json');
+  try {
+    manager.addHost({ name: 'production', host: 'prod.example.test', password: 'secret' });
+    fs.mkdirSync(path.dirname(destination));
+    fs.writeFileSync(destination, 'previous export');
+    const json = manager.exportHosts(destination);
+
+    assert.equal(fs.readFileSync(destination, 'utf8'), json);
+    assert.deepEqual(fs.readdirSync(path.dirname(destination)), ['hosts.json']);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(destination).mode & 0o777, 0o600);
+
+    const newDestination = path.join(temporary, 'new', 'private', 'hosts.json');
+    manager.exportHosts(newDestination);
+    assert.equal(fs.readFileSync(newDestination, 'utf8'), json);
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(path.dirname(newDestination)).mode & 0o777, 0o700);
+      assert.equal(fs.statSync(newDestination).mode & 0o777, 0o600);
+    }
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 test('ConfigManager: invalid app settings never silently reset host key policy', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-invalid-app-'));
   try {

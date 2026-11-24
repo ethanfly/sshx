@@ -3,6 +3,11 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { calculateLevenshteinDistance, resolvePortablePath, toPortablePath } from './config-paths.js';
+import { parseOpenSSHConfigFile } from './openssh-config.js';
+
+export { calculateLevenshteinDistance, resolvePortablePath, toPortablePath } from './config-paths.js';
+export { parseOpenSSHConfig, parseOpenSSHConfigFile } from './openssh-config.js';
 
 const hostProfileSchema = z.object({
   id: z.string().min(1),
@@ -70,21 +75,24 @@ function requireUniqueHosts(hosts: HostProfile[]): void {
   }
 }
 
+const endpointCredentials = ['password', 'privateKeyPath', 'privateKey', 'passphrase', 'proxyJump', 'proxyCommand'] as const;
+
 function mergeHostProfile(profile: HostInput, existing?: HostProfile): HostProfile {
   const endpointChanged = existing && (profile.host !== existing.host ||
     (profile.port ?? existing.port) !== existing.port || (profile.username ?? existing.username) !== existing.username);
-  const inherited = {
-    ...existing,
-    ...(endpointChanged ? {
-      authType: undefined,
-      password: undefined,
-      privateKeyPath: undefined,
-      privateKey: undefined,
-      passphrase: undefined,
-      proxyJump: undefined,
-      proxyCommand: undefined
-    } : {})
-  };
+  const provided: HostInput = { ...profile };
+  const inherited: Partial<HostProfile> = { ...existing };
+  if (endpointChanged && existing) {
+    inherited.authType = undefined;
+    if (provided.authType === existing.authType) delete provided.authType;
+    for (const key of endpointCredentials) {
+      inherited[key] = undefined;
+      if (provided[key] === existing[key] || (key === 'privateKeyPath' && provided[key] !== undefined &&
+          toPortablePath(provided[key]) === toPortablePath(existing.privateKeyPath ?? ''))) {
+        delete provided[key];
+      }
+    }
+  }
   if (existing && !endpointChanged) {
     const newPath = profile.privateKeyPath;
     const oldPath = existing.privateKeyPath;
@@ -98,9 +106,9 @@ function mergeHostProfile(profile: HostInput, existing?: HostProfile): HostProfi
     username: 'root',
     tags: [],
     ...inherited,
-    ...Object.fromEntries(Object.entries(profile).filter(([, value]) => value !== undefined)),
+    ...Object.fromEntries(Object.entries(provided).filter(([, value]) => value !== undefined)),
     id: existing?.id ?? profile.id ?? `host_${randomUUID()}`,
-    authType: profile.authType ?? inherited.authType ?? (profile.privateKeyPath || profile.privateKey ? 'privateKey' : 'password')
+    authType: provided.authType ?? inherited.authType ?? (provided.privateKeyPath || provided.privateKey ? 'privateKey' : 'password')
   });
   if (normalized.privateKeyPath) {
     normalized.privateKeyPath = toPortablePath(normalized.privateKeyPath);
@@ -393,24 +401,15 @@ export class ConfigManager {
     if (index === -1) return null;
 
     const current = hosts[index];
-    const updated = hostProfileSchema.parse({
-      ...current,
+    const updated = mergeHostProfile({
       ...updates,
-      id: current.id,
       name: updates.name ?? current.name,
-      host: updates.host ?? current.host,
-      port: updates.port ?? current.port,
-      username: updates.username ?? current.username,
-      authType: updates.authType ?? current.authType
-    });
+      host: updates.host ?? current.host
+    }, current);
     if (hostNameKey(updated.name) !== hostNameKey(current.name) &&
         hosts.some(host => hostNameKey(host.name) === hostNameKey(updated.name))) {
       throw new DuplicateHostError(updated.name);
     }
-    if (updated.privateKeyPath) {
-      updated.privateKeyPath = toPortablePath(updated.privateKeyPath);
-    }
-
     hosts[index] = updated;
     this.saveHosts(hosts);
     return updated;
@@ -440,8 +439,8 @@ export class ConfigManager {
     if (exportPath) {
       const resolved = resolvePortablePath(exportPath);
       const dir = path.dirname(resolved);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(resolved, json, { mode: 0o600 });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writePrivateFile(resolved, json);
     }
     return json;
   }
@@ -492,7 +491,7 @@ export class ConfigManager {
 
     changes.forEach((profile, index) => {
       const incomingJump = incoming[index].proxyJump;
-      if (incomingJump !== undefined) {
+      if (incomingJump !== undefined && profile.proxyJump !== undefined) {
         profile.proxyJump = mappedIds.get(incomingJump) ?? incomingJump;
       }
       hostsById.set(profile.id, profile);
@@ -556,226 +555,6 @@ export function writePrivateFile(filePath: string, content: string): void {
     try { fs.unlinkSync(temporary); } catch {}
     throw error;
   }
-}
-
-/**
- * Resolves portable paths (~, environment variables, relative paths) to absolute paths on the local OS
- */
-export function resolvePortablePath(filePath: string, baseDir?: string): string {
-  if (!filePath) return '';
-
-  let p = filePath.trim();
-
-  // 1. Expand environment variables: $VAR, ${VAR}, %VAR%
-  p = p.replace(/\$([A-Za-z0-9_]+)|\$\{([A-Za-z0-9_]+)\}|%([A-Za-z0-9_]+)%/g, (_, a, b, c) => {
-    const varName = a || b || c;
-    const val = process.env[varName];
-    if (val !== undefined && val !== '') return val;
-    // Cross-platform fallback for HOME and USERPROFILE across Linux/macOS/Windows
-    if (varName === 'HOME' || varName === 'USERPROFILE') {
-      return os.homedir();
-    }
-    return '';
-  });
-
-  // 2. Expand home directory prefix (~/ or ~\)
-  const home = os.homedir();
-  if (p === '~') {
-    return home;
-  }
-  if (p.startsWith('~/') || p.startsWith('~\\')) {
-    p = path.join(home, p.slice(2));
-  }
-
-  // 3. Resolve relative path against base directory or CWD
-  if (!path.isAbsolute(p)) {
-    p = path.resolve(baseDir || process.cwd(), p);
-  }
-
-  return path.normalize(p);
-}
-
-/**
- * Converts local absolute path to cross-platform portable path format with normalized forward slashes and ~ prefix
- */
-export function toPortablePath(filePath: string, baseDir?: string): string {
-  if (!filePath) return '';
-
-  let p = filePath.trim().replace(/\\/g, '/');
-  const home = os.homedir().replace(/\\/g, '/');
-
-  // Replace home directory with ~
-  if (p === home) {
-    return '~';
-  }
-  if (p.toLowerCase().startsWith(home.toLowerCase() + '/')) {
-    p = '~' + p.slice(home.length);
-    return p;
-  }
-
-  // If inside baseDir, make it relative
-  if (baseDir) {
-    const base = baseDir.replace(/\\/g, '/');
-    if (p.toLowerCase().startsWith(base.toLowerCase() + '/')) {
-      p = p.slice(base.length + 1);
-      return p;
-    }
-  }
-
-  return p;
-}
-
-/**
- * Compute edit distance between two strings for typo suggestions
- */
-export function calculateLevenshteinDistance(a: string, b: string): number {
-  if (a.length < b.length) [a, b] = [b, a];
-  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
-  let current = new Array<number>(b.length + 1);
-
-  for (let row = 1; row <= a.length; row++) {
-    current[0] = row;
-    for (let column = 1; column <= b.length; column++) {
-      const cost = a[row - 1] === b[column - 1] ? 0 : 1;
-      current[column] = Math.min(
-        previous[column] + 1,
-        current[column - 1] + 1,
-        previous[column - 1] + cost
-      );
-    }
-    [previous, current] = [current, previous];
-  }
-  return previous[b.length];
-}
-
-/**
- * Parses OpenSSH config file resolving Include directives
- */
-export function parseOpenSSHConfigFile(filePath: string, visited: Set<string> = new Set()): Array<Omit<HostProfile, 'id'>> {
-  const resolvedPath = resolvePortablePath(filePath);
-  if (visited.has(resolvedPath) || !fs.existsSync(resolvedPath)) {
-    return [];
-  }
-  visited.add(resolvedPath);
-
-  const baseDir = path.dirname(resolvedPath);
-  const content = fs.readFileSync(resolvedPath, 'utf8');
-  return parseOpenSSHConfigContents(content, value => {
-    const includePattern = value.startsWith('/') || value.startsWith('~')
-      ? resolvePortablePath(value)
-      : path.resolve(baseDir, value);
-    const includeDir = path.dirname(includePattern);
-    const filePattern = path.basename(includePattern);
-    if (!fs.existsSync(includeDir)) return [];
-
-    const regex = new RegExp(`^${filePattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
-    const hosts: Array<Omit<HostProfile, 'id'>> = [];
-    for (const entry of fs.readdirSync(includeDir).sort()) {
-      if (!regex.test(entry)) continue;
-      const fullPath = path.join(includeDir, entry);
-      if (fs.statSync(fullPath).isFile()) hosts.push(...parseOpenSSHConfigFile(fullPath, visited));
-    }
-    return hosts;
-  });
-}
-
-/**
- * Parses OpenSSH ~/.ssh/config format string
- */
-export function parseOpenSSHConfig(content: string): Array<Omit<HostProfile, 'id'>> {
-  return parseOpenSSHConfigContents(content);
-}
-
-function parseOpenSSHConfigContents(
-  content: string,
-  include?: (pattern: string) => Array<Omit<HostProfile, 'id'>>
-): Array<Omit<HostProfile, 'id'>> {
-  const lines = content.split('\n');
-  const hosts: Array<Omit<HostProfile, 'id'>> = [];
-  let currentHost: Partial<HostProfile> | null = null;
-
-  for (let line of lines) {
-    line = line.trim();
-    if (!line || line.startsWith('#')) continue;
-
-    const parts = line.split(/\s+/);
-    const keyword = parts[0].toLowerCase();
-    const value = parts.slice(1).join(' ').replace(/^["']|["']$/g, '');
-
-    if (keyword === 'include') {
-      if (include) hosts.push(...include(value));
-    } else if (keyword === 'host') {
-      if (currentHost && currentHost.name && currentHost.name !== '*') {
-        finalizeHost(currentHost, hosts);
-      }
-      currentHost = {
-        name: value,
-        host: value,
-        port: 22,
-        username: os.userInfo().username || 'root',
-        authType: 'privateKey',
-        tags: ['imported-ssh-config']
-      };
-    } else if (currentHost) {
-      switch (keyword) {
-        case 'hostname':
-          currentHost.host = value;
-          break;
-        case 'user':
-          currentHost.username = value;
-          break;
-        case 'port':
-          currentHost.port = parseInt(value, 10) || 22;
-          break;
-        case 'identityfile':
-          currentHost.privateKeyPath = toPortablePath(value);
-          currentHost.authType = 'privateKey';
-          break;
-        case 'preferredauthentications':
-          if (value.toLowerCase().startsWith('password')) currentHost.authType = 'password';
-          break;
-        case 'proxyjump':
-          currentHost.proxyJump = value;
-          break;
-        case 'proxycommand':
-          currentHost.proxyCommand = value;
-          break;
-        case 'serveraliveinterval':
-          currentHost.keepaliveInterval = (parseInt(value, 10) || 15) * 1000;
-          break;
-        case 'serveralivecountmax':
-          currentHost.keepaliveCountMax = parseInt(value, 10) || 3;
-          break;
-      }
-    }
-  }
-
-  if (currentHost && currentHost.name && currentHost.name !== '*') {
-    finalizeHost(currentHost, hosts);
-  }
-
-  return hosts;
-}
-
-function finalizeHost(host: Partial<HostProfile>, list: Array<Omit<HostProfile, 'id'>>) {
-  if (!host.name || host.name.includes('*') || host.name.includes('?')) return;
-  list.push({
-    name: host.name,
-    host: host.host || host.name,
-    port: host.port || 22,
-    username: host.username || os.userInfo().username || 'root',
-    authType: host.authType || 'privateKey',
-    privateKeyPath: host.privateKeyPath,
-    proxyJump: host.proxyJump,
-    proxyCommand: host.proxyCommand,
-    keepaliveInterval: host.keepaliveInterval,
-    keepaliveCountMax: host.keepaliveCountMax,
-    tags: host.tags || ['imported-ssh-config']
-  });
-}
-
-function resolveTilde(filePath: string): string {
-  return resolvePortablePath(filePath);
 }
 
 export const defaultConfigManager = new ConfigManager();

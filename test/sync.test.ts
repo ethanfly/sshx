@@ -313,6 +313,40 @@ test('ConfigManager: invalid overwrite import does not modify the saved hosts', 
   }
 });
 
+test('ConfigManager: full-profile overwrite does not carry credentials to a new endpoint', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-overwrite-endpoint-'));
+  try {
+    const config = new ConfigManager(temporary);
+    const original = config.addHost({
+      name: 'production', host: 'old.example.test', authType: 'privateKey',
+      privateKeyPath: '~/.ssh/old-key', passphrase: 'old phrase', password: 'old password',
+      proxyJump: 'old-jump', proxyCommand: 'old proxy'
+    });
+    const replaced = config.addHost({ ...original, host: 'new.example.test' }, { overwrite: true });
+    assert.strictEqual(replaced.id, original.id);
+    assert.strictEqual(replaced.authType, 'password');
+    for (const key of ['privateKeyPath', 'passphrase', 'password', 'proxyJump', 'proxyCommand'] as const) {
+      assert.strictEqual(replaced[key], undefined);
+    }
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('ConfigManager: imported snapshot cannot restore a previous jump on another endpoint', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-import-endpoint-jump-'));
+  try {
+    const config = new ConfigManager(temporary);
+    const original = config.addHost({
+      name: 'production', host: 'old.example.test', proxyJump: 'old-jump'
+    });
+    config.importHostsFromJson(JSON.stringify([{ ...original, host: 'new.example.test' }]));
+    assert.strictEqual(config.getHost(original.id)?.proxyJump, undefined);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 test('ConfigManager: replacement and merge do not reuse old credentials after a private key change', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-key-replace-'));
   try {
