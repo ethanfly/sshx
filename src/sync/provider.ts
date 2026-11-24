@@ -18,6 +18,8 @@ export interface GistConfig {
   description?: string;
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
 /**
  * WebDAV Provider (compatible with Jianguoyun, Nextcloud, ownCloud, Synology, Alist, etc.)
  */
@@ -27,7 +29,7 @@ export class WebDavProvider implements SyncProvider {
   private authHeader: string;
   private filename: string;
 
-  constructor(private config: WebDavConfig) {
+  constructor(private config: WebDavConfig, private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     this.baseUrl = config.url.replace(/\/+$/, '');
     this.filename = config.filename || 'hosts.enc';
     const authString = Buffer.from(`${config.username}:${config.password}`).toString('base64');
@@ -38,10 +40,14 @@ export class WebDavProvider implements SyncProvider {
     return `${this.baseUrl}/${this.filename}`;
   }
 
+  private request(input: string | URL, init?: RequestInit): Promise<Response> {
+    return fetchWithTimeout(input, init, this.requestTimeoutMs);
+  }
+
   public async test(): Promise<{ ok: boolean; message: string }> {
     try {
       // Test base directory access (PROPFIND or HEAD or GET)
-      const res = await fetch(this.baseUrl, {
+      const res = await this.request(this.baseUrl, {
         method: 'PROPFIND',
         headers: {
           Authorization: this.authHeader,
@@ -58,7 +64,7 @@ export class WebDavProvider implements SyncProvider {
       }
 
       // Try GET as fallback if PROPFIND is disallowed
-      const getRes = await fetch(this.baseUrl, {
+      const getRes = await this.request(this.baseUrl, {
         method: 'GET',
         headers: { Authorization: this.authHeader }
       });
@@ -73,18 +79,14 @@ export class WebDavProvider implements SyncProvider {
   }
 
   private async ensureDirectory(): Promise<void> {
-    try {
-      await fetch(this.baseUrl, {
-        method: 'MKCOL',
-        headers: { Authorization: this.authHeader }
-      });
-    } catch {
-      // Ignore MKCOL error if directory already exists
-    }
+    await this.request(this.baseUrl, {
+      method: 'MKCOL',
+      headers: { Authorization: this.authHeader }
+    });
   }
 
   public async pull(): Promise<string> {
-    const res = await fetch(this.fileUrl, {
+    const res = await this.request(this.fileUrl, {
       method: 'GET',
       headers: { Authorization: this.authHeader }
     });
@@ -103,7 +105,7 @@ export class WebDavProvider implements SyncProvider {
   public async push(encryptedBlob: string): Promise<{ remoteId?: string }> {
     await this.ensureDirectory();
 
-    const res = await fetch(this.fileUrl, {
+    const res = await this.request(this.fileUrl, {
       method: 'PUT',
       headers: {
         Authorization: this.authHeader,
@@ -127,7 +129,11 @@ export class GistProvider implements SyncProvider {
   public name = 'gist';
   private static GIST_FILENAME = 'sshx-hosts.enc';
 
-  constructor(private config: GistConfig) {}
+  constructor(private config: GistConfig, private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {}
+
+  private request(input: string | URL, init?: RequestInit): Promise<Response> {
+    return fetchWithTimeout(input, init, this.requestTimeoutMs);
+  }
 
   private get headers(): Record<string, string> {
     return {
@@ -139,7 +145,7 @@ export class GistProvider implements SyncProvider {
 
   public async test(): Promise<{ ok: boolean; message: string }> {
     try {
-      const res = await fetch('https://api.github.com/user', {
+      const res = await this.request('https://api.github.com/user', {
         headers: this.headers
       });
 
@@ -154,7 +160,7 @@ export class GistProvider implements SyncProvider {
         }
 
         if (this.config.gistId) {
-          const gistRes = await fetch(`https://api.github.com/gists/${this.config.gistId}`, {
+          const gistRes = await this.request(`https://api.github.com/gists/${this.config.gistId}`, {
             headers: this.headers
           });
           if (gistRes.status === 404) {
@@ -190,7 +196,7 @@ export class GistProvider implements SyncProvider {
       this.config.gistId = gistId;
     }
 
-    let res = await fetch(`https://api.github.com/gists/${gistId}`, {
+    let res = await this.request(`https://api.github.com/gists/${gistId}`, {
       headers: this.headers
     });
 
@@ -200,7 +206,7 @@ export class GistProvider implements SyncProvider {
       if (autoFound && autoFound !== gistId) {
         gistId = autoFound;
         this.config.gistId = gistId;
-        res = await fetch(`https://api.github.com/gists/${gistId}`, {
+        res = await this.request(`https://api.github.com/gists/${gistId}`, {
           headers: this.headers
         });
       }
@@ -214,13 +220,16 @@ export class GistProvider implements SyncProvider {
       throw new Error(`Gist pull failed (${res.status} ${res.statusText})`);
     }
 
-    const data = await res.json() as any;
-    const file = data.files?.[GistProvider.GIST_FILENAME];
-    if (!file || !file.content) {
+    const data: unknown = await res.json();
+    const files = data && typeof data === 'object' ? (data as { files?: unknown }).files : undefined;
+    const file = files && typeof files === 'object'
+      ? (files as Record<string, unknown>)[GistProvider.GIST_FILENAME] : undefined;
+    const content = file && typeof file === 'object' ? (file as { content?: unknown }).content : undefined;
+    if (typeof content !== 'string') {
       throw new Error(`Gist does not contain '${GistProvider.GIST_FILENAME}'.`);
     }
 
-    return file.content;
+    return content;
   }
 
   public async push(encryptedBlob: string): Promise<{ remoteId?: string }> {
@@ -234,7 +243,7 @@ export class GistProvider implements SyncProvider {
 
     if (gistId) {
       // Update existing Gist
-      const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+      const res = await this.request(`https://api.github.com/gists/${gistId}`, {
         method: 'PATCH',
         headers: this.headers,
         body: JSON.stringify({
@@ -267,7 +276,7 @@ export class GistProvider implements SyncProvider {
     }
 
     // Create new secret Gist
-    const res = await fetch('https://api.github.com/gists', {
+    const res = await this.request('https://api.github.com/gists', {
       method: 'POST',
       headers: this.headers,
       body: JSON.stringify({
@@ -291,27 +300,52 @@ export class GistProvider implements SyncProvider {
       throw new Error(`Failed to create secret Gist (${msg})`);
     }
 
-    const created = await res.json() as any;
-    this.config.gistId = created.id;
-    return { remoteId: created.id };
+    const created: unknown = await res.json();
+    const id = created && typeof created === 'object' ? (created as { id?: unknown }).id : undefined;
+    if (typeof id !== 'string' || !id) throw new Error('GitHub created a Gist but returned no ID. Check your Gists before retrying to avoid creating duplicates.');
+    this.config.gistId = id;
+    return { remoteId: id };
   }
 
   private async findSshxGistId(): Promise<string | undefined> {
-    try {
-      const res = await fetch('https://api.github.com/gists?per_page=50', {
-        headers: this.headers
-      });
-      if (!res.ok) return undefined;
-
-      const gists = await res.json() as any[];
-      for (const g of gists) {
-        if (g.files && g.files[GistProvider.GIST_FILENAME]) {
-          return g.id;
-        }
+    let url = 'https://api.github.com/gists?per_page=100';
+    const seen = new Set<string>();
+    while (url) {
+      if (seen.has(url) || seen.size >= 100) {
+        throw new Error('GitHub Gist lookup exceeded the page limit; refusing to create a duplicate backup.');
       }
-    } catch {
-      // fallback
+      seen.add(url);
+      const res = await this.request(url, { headers: this.headers });
+      if (!res.ok) throw new Error(`GitHub Gist lookup failed (${res.status} ${res.statusText})`);
+
+      const payload: unknown = await res.json();
+      if (!Array.isArray(payload)) throw new Error('GitHub Gist lookup returned an invalid response.');
+      for (const gist of payload) {
+        if (!gist || typeof gist !== 'object') continue;
+        const files = (gist as { files?: unknown }).files;
+        if (!files || typeof files !== 'object' || !(GistProvider.GIST_FILENAME in files)) continue;
+        const id = (gist as { id?: unknown }).id;
+        if (typeof id === 'string' && id.length > 0) return id;
+      }
+
+      const next = res.headers.get('link')?.split(',').map(part => part.trim())
+        .find(part => /;\s*rel="next"$/.test(part))?.match(/^<([^>]+)>;/)?.[1];
+      if (next) {
+        const candidate = new URL(next);
+        if (candidate.origin !== 'https://api.github.com' || candidate.pathname !== '/gists') {
+          throw new Error('GitHub Gist lookup returned an unsafe pagination URL.');
+        }
+        url = candidate.href;
+      } else {
+        url = '';
+      }
     }
     return undefined;
   }
+}
+
+function fetchWithTimeout(input: string | URL, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+  return fetch(input, { ...init, signal });
 }

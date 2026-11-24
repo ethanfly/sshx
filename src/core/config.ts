@@ -32,6 +32,16 @@ const hostProfileSchema = z.object({
 const importedHostSchema = hostProfileSchema.partial({ id: true, port: true, username: true, authType: true });
 const hostListSchema = z.array(hostProfileSchema);
 const importedHostListSchema = z.array(importedHostSchema);
+const appConfigSchema = z.object({
+  defaultPort: z.number().int().min(1).max(65535),
+  defaultUsername: z.string(),
+  defaultKeyPath: z.string().optional(),
+  strictHostKeyChecking: z.enum(['yes', 'no', 'accept-new']),
+  theme: z.enum(['dark', 'light', 'dracula', 'nord', 'catppuccin']),
+  terminalFontSize: z.number().positive(),
+  terminalFontFamily: z.string(),
+  recentHostsLimit: z.number().int().nonnegative()
+});
 
 export type HostProfile = z.infer<typeof hostProfileSchema>;
 type HostInput = z.infer<typeof importedHostSchema>;
@@ -190,40 +200,40 @@ export class ConfigManager {
 
   public getAppConfig(): AppConfig {
     this.ensureDirs();
-    if (!fs.existsSync(this.configFilePath)) {
-      const def = this.getDefaultAppConfig();
-      try {
-        fs.writeFileSync(this.configFilePath, JSON.stringify(def, null, 2), { mode: 0o600 });
-      } catch {
-        // ignore
-      }
-      return def;
-    }
+    let raw: string;
     try {
-      const raw = fs.readFileSync(this.configFilePath, 'utf8');
-      return { ...this.getDefaultAppConfig(), ...JSON.parse(raw) };
-    } catch {
-      return this.getDefaultAppConfig();
+      raw = fs.readFileSync(this.configFilePath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new Error(`Could not read app configuration '${this.configFilePath}': ${(error as Error).message}`);
+      }
+      const defaults = this.getDefaultAppConfig();
+      this.saveAppConfig(defaults);
+      return defaults;
     }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`Invalid JSON in app configuration '${this.configFilePath}'.`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`Invalid app configuration '${this.configFilePath}' (at root).`);
+    }
+    const result = appConfigSchema.safeParse({ ...this.getDefaultAppConfig(), ...parsed });
+    if (!result.success) {
+      const location = result.error.issues[0].path.join('.') || 'root';
+      throw new Error(`Invalid app configuration '${this.configFilePath}' (at ${location}).`);
+    }
+    return result.data;
   }
 
   public saveAppConfig(config: Partial<AppConfig>): AppConfig {
+    const current = fs.existsSync(this.configFilePath) ? this.getAppConfig() : this.getDefaultAppConfig();
+    const updated = appConfigSchema.parse({ ...current, ...config });
     this.ensureDirs();
-    let current: AppConfig;
-    try {
-      if (fs.existsSync(this.configFilePath)) {
-        const raw = fs.readFileSync(this.configFilePath, 'utf8');
-        current = { ...this.getDefaultAppConfig(), ...JSON.parse(raw) };
-      } else {
-        current = this.getDefaultAppConfig();
-      }
-    } catch {
-      current = this.getDefaultAppConfig();
-    }
-    const updated = { ...current, ...config };
-    fs.writeFileSync(this.configFilePath, JSON.stringify(updated, null, 2), {
-      mode: 0o600
-    });
+    writePrivateFile(this.configFilePath, JSON.stringify(updated, null, 2));
     return updated;
   }
 
@@ -258,20 +268,7 @@ export class ConfigManager {
   public saveHosts(hosts: HostProfile[]): void {
     this.ensureDirs();
     const data = JSON.stringify(hostListSchema.parse(hosts), null, 2);
-    const temporary = `${this.hostsFilePath}.${randomUUID()}.tmp`;
-    const descriptor = fs.openSync(temporary, 'wx', 0o600);
-    try {
-      try {
-        fs.writeFileSync(descriptor, data);
-        fs.fsyncSync(descriptor);
-      } finally {
-        fs.closeSync(descriptor);
-      }
-      fs.renameSync(temporary, this.hostsFilePath);
-    } catch (error) {
-      try { fs.unlinkSync(temporary); } catch {}
-      throw error;
-    }
+    writePrivateFile(this.hostsFilePath, data);
   }
 
   public getHost(idOrName: string): HostProfile | undefined {
@@ -544,6 +541,23 @@ export class ConfigManager {
   }
 }
 
+export function writePrivateFile(filePath: string, content: string): void {
+  const temporary = `${filePath}.${randomUUID()}.tmp`;
+  const descriptor = fs.openSync(temporary, 'wx', 0o600);
+  try {
+    try {
+      fs.writeFileSync(descriptor, content);
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    fs.renameSync(temporary, filePath);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch {}
+    throw error;
+  }
+}
+
 /**
  * Resolves portable paths (~, environment variables, relative paths) to absolute paths on the local OS
  */
@@ -615,24 +629,23 @@ export function toPortablePath(filePath: string, baseDir?: string): string {
  * Compute edit distance between two strings for typo suggestions
  */
 export function calculateLevenshteinDistance(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  if (a.length < b.length) [a, b] = [b, a];
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  let current = new Array<number>(b.length + 1);
 
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
+  for (let row = 1; row <= a.length; row++) {
+    current[0] = row;
+    for (let column = 1; column <= b.length; column++) {
+      const cost = a[row - 1] === b[column - 1] ? 0 : 1;
+      current[column] = Math.min(
+        previous[column] + 1,
+        current[column - 1] + 1,
+        previous[column - 1] + cost
       );
     }
+    [previous, current] = [current, previous];
   }
-  return dp[m][n];
+  return previous[b.length];
 }
 
 /**
@@ -647,6 +660,36 @@ export function parseOpenSSHConfigFile(filePath: string, visited: Set<string> = 
 
   const baseDir = path.dirname(resolvedPath);
   const content = fs.readFileSync(resolvedPath, 'utf8');
+  return parseOpenSSHConfigContents(content, value => {
+    const includePattern = value.startsWith('/') || value.startsWith('~')
+      ? resolvePortablePath(value)
+      : path.resolve(baseDir, value);
+    const includeDir = path.dirname(includePattern);
+    const filePattern = path.basename(includePattern);
+    if (!fs.existsSync(includeDir)) return [];
+
+    const regex = new RegExp(`^${filePattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
+    const hosts: Array<Omit<HostProfile, 'id'>> = [];
+    for (const entry of fs.readdirSync(includeDir).sort()) {
+      if (!regex.test(entry)) continue;
+      const fullPath = path.join(includeDir, entry);
+      if (fs.statSync(fullPath).isFile()) hosts.push(...parseOpenSSHConfigFile(fullPath, visited));
+    }
+    return hosts;
+  });
+}
+
+/**
+ * Parses OpenSSH ~/.ssh/config format string
+ */
+export function parseOpenSSHConfig(content: string): Array<Omit<HostProfile, 'id'>> {
+  return parseOpenSSHConfigContents(content);
+}
+
+function parseOpenSSHConfigContents(
+  content: string,
+  include?: (pattern: string) => Array<Omit<HostProfile, 'id'>>
+): Array<Omit<HostProfile, 'id'>> {
   const lines = content.split('\n');
   const hosts: Array<Omit<HostProfile, 'id'>> = [];
   let currentHost: Partial<HostProfile> | null = null;
@@ -660,35 +703,8 @@ export function parseOpenSSHConfigFile(filePath: string, visited: Set<string> = 
     const value = parts.slice(1).join(' ').replace(/^["']|["']$/g, '');
 
     if (keyword === 'include') {
-      // Handle Include wildcard (e.g. config.d/*) or direct files
-      const includePattern = value.startsWith('/') || value.startsWith('~')
-        ? resolvePortablePath(value)
-        : path.resolve(baseDir, value);
-
-      const includeDir = path.dirname(includePattern);
-      const filePattern = path.basename(includePattern);
-
-      if (fs.existsSync(includeDir)) {
-        try {
-          const entries = fs.readdirSync(includeDir);
-          const regex = new RegExp('^' + filePattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
-          for (const entry of entries) {
-            if (regex.test(entry)) {
-              const fullEntryPath = path.join(includeDir, entry);
-              if (fs.statSync(fullEntryPath).isFile()) {
-                const nestedHosts = parseOpenSSHConfigFile(fullEntryPath, visited);
-                hosts.push(...nestedHosts);
-              }
-            }
-          }
-        } catch {
-          // ignore read errors
-        }
-      }
-      continue;
-    }
-
-    if (keyword === 'host') {
+      if (include) hosts.push(...include(value));
+    } else if (keyword === 'host') {
       if (currentHost && currentHost.name && currentHost.name !== '*') {
         finalizeHost(currentHost, hosts);
       }
@@ -716,75 +732,7 @@ export function parseOpenSSHConfigFile(filePath: string, visited: Set<string> = 
           currentHost.authType = 'privateKey';
           break;
         case 'preferredauthentications':
-          if (value.toLowerCase().startsWith('password')) {
-            currentHost.authType = 'password';
-          }
-          break;
-        case 'proxyjump':
-          currentHost.proxyJump = value;
-          break;
-        case 'proxycommand':
-          currentHost.proxyCommand = value;
-          break;
-        case 'serveraliveinterval':
-          currentHost.keepaliveInterval = (parseInt(value, 10) || 15) * 1000;
-          break;
-        case 'serveralivecountmax':
-          currentHost.keepaliveCountMax = parseInt(value, 10) || 3;
-          break;
-      }
-    }
-  }
-
-  if (currentHost && currentHost.name && currentHost.name !== '*') {
-    finalizeHost(currentHost, hosts);
-  }
-
-  return hosts;
-}
-
-/**
- * Parses OpenSSH ~/.ssh/config format string
- */
-export function parseOpenSSHConfig(content: string): Array<Omit<HostProfile, 'id'>> {
-  const lines = content.split('\n');
-  const hosts: Array<Omit<HostProfile, 'id'>> = [];
-  let currentHost: Partial<HostProfile> | null = null;
-
-  for (let line of lines) {
-    line = line.trim();
-    if (!line || line.startsWith('#')) continue;
-
-    const parts = line.split(/\s+/);
-    const keyword = parts[0].toLowerCase();
-    const value = parts.slice(1).join(' ').replace(/^["']|["']$/g, '');
-
-    if (keyword === 'host') {
-      if (currentHost && currentHost.name && currentHost.name !== '*') {
-        finalizeHost(currentHost, hosts);
-      }
-      currentHost = {
-        name: value,
-        host: value,
-        port: 22,
-        username: os.userInfo().username || 'root',
-        authType: 'privateKey',
-        tags: ['imported-ssh-config']
-      };
-    } else if (currentHost) {
-      switch (keyword) {
-        case 'hostname':
-          currentHost.host = value;
-          break;
-        case 'user':
-          currentHost.username = value;
-          break;
-        case 'port':
-          currentHost.port = parseInt(value, 10) || 22;
-          break;
-        case 'identityfile':
-          currentHost.privateKeyPath = toPortablePath(value);
-          currentHost.authType = 'privateKey';
+          if (value.toLowerCase().startsWith('password')) currentHost.authType = 'password';
           break;
         case 'proxyjump':
           currentHost.proxyJump = value;

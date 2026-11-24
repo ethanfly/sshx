@@ -4,7 +4,7 @@ import { defaultConfigManager, HostProfile } from '../core/config.js';
 import { SSHConnection } from '../core/client.js';
 import { execCommand } from '../core/exec.js';
 import { SFTPClient } from '../core/sftp.js';
-import { KeyManager } from '../core/keygen.js';
+import { KeyManager, KeyPairResult } from '../core/keygen.js';
 import { resolveTarget } from '../cli/connect.js';
 
 export class SkillTools {
@@ -122,7 +122,14 @@ export class SkillTools {
   /**
    * List remote directory via SFTP
    */
-  public static async sftpList(hostOrTarget: string, remotePath: string = '.'): Promise<any[]> {
+  public static async sftpList(hostOrTarget: string, remotePath: string = '.'): Promise<Array<{
+    name: string;
+    path: string;
+    isDirectory: boolean;
+    size: number;
+    permissions: string;
+    modified: string;
+  }>> {
     const profile = resolveTarget(hostOrTarget);
     const conn = new SSHConnection({ profile });
 
@@ -215,7 +222,17 @@ export class SkillTools {
   /**
    * Gather comprehensive system information from remote machine
    */
-  public static async getSystemInfo(hostOrTarget: string): Promise<Record<string, any>> {
+  public static async getSystemInfo(hostOrTarget: string): Promise<{
+    host: string;
+    username: string;
+    hostname: string;
+    os: string;
+    kernel: string;
+    uptime: string;
+    cpu: string[];
+    memory: string[];
+    disk: string[];
+  }> {
     const profile = resolveTarget(hostOrTarget);
     const conn = new SSHConnection({ profile });
 
@@ -260,7 +277,7 @@ export class SkillTools {
   /**
    * Generate an SSH keypair
    */
-  public static generateKey(options: { type?: 'ed25519' | 'rsa'; bits?: number; comment?: string }): any {
+  public static generateKey(options: { type?: 'ed25519' | 'rsa'; bits?: number; comment?: string }): KeyPairResult {
     return KeyManager.generateKeyPair(options);
   }
 }

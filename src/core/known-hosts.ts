@@ -38,47 +38,32 @@ export class KnownHostsManager {
   }
 
   public getEntries(): KnownHostEntry[] {
-    if (!fs.existsSync(this.knownHostsPath)) {
-      return [];
-    }
-
+    let content: string;
     try {
-      const content = fs.readFileSync(this.knownHostsPath, 'utf8');
-      const lines = content.split('\n');
-      const entries: KnownHostEntry[] = [];
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line || line.startsWith('#')) continue;
-
-        const parts = line.split(/\s+/);
-        if (parts.length >= 2) {
-          // Format 1: host keyType base64 [comment]
-          // Format 2: host,ip keyType base64 [comment]
-          // Format 3: |1|hash|salt keyType base64 [comment] (hashed host)
-          if (parts[0].startsWith('|1|')) {
-            entries.push({
-              host: parts[0],
-              keyType: parts[1],
-              publicKey: parts[2] || '',
-              comment: parts.slice(3).join(' ') || undefined,
-              line: i + 1
-            });
-          } else {
-            entries.push({
-              host: parts[0],
-              keyType: parts[1],
-              publicKey: parts[2] || '',
-              comment: parts.slice(3).join(' ') || undefined,
-              line: i + 1
-            });
-          }
-        }
-      }
-      return entries;
-    } catch {
-      return [];
+      content = fs.readFileSync(this.knownHostsPath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw new Error(`Could not read known hosts file '${this.knownHostsPath}': ${(error as Error).message}`);
     }
+
+    const lines = content.split('\n');
+    const entries: KnownHostEntry[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line || line.startsWith('#')) continue;
+
+      const parts = line.split(/\s+/);
+      if (parts.length >= 2) {
+        entries.push({
+          host: parts[0],
+          keyType: parts[1],
+          publicKey: parts[2] || '',
+          comment: parts.slice(3).join(' ') || undefined,
+          line: i + 1
+        });
+      }
+    }
+    return entries;
   }
 
   /**
@@ -135,12 +120,7 @@ export class KnownHostsManager {
 
     if (matchingEntries.length === 0) {
       if (mode === 'accept-new') {
-        this.addHostKey(hostIdent, keyType, keyBase64);
-        return {
-          status: 'new',
-          fingerprint,
-          message: `Permanently added '${hostIdent}' (${keyType}) to the list of known hosts.`
-        };
+        return this.acceptNewHostKey(hostIdent, keyType, keyBase64, fingerprint);
       } else {
         return {
           status: 'mismatch',
@@ -164,12 +144,7 @@ export class KnownHostsManager {
     const sameTypeEntries = matchingEntries.filter(e => e.keyType === keyType);
     if (sameTypeEntries.length === 0) {
       if (mode === 'accept-new') {
-        this.addHostKey(hostIdent, keyType, keyBase64);
-        return {
-          status: 'new',
-          fingerprint,
-          message: `Permanently added '${hostIdent}' (${keyType}) to the list of known hosts.`
-        };
+        return this.acceptNewHostKey(hostIdent, keyType, keyBase64, fingerprint);
       } else {
         return {
           status: 'mismatch',
@@ -188,14 +163,32 @@ export class KnownHostsManager {
 
   public addHostKey(hostIdent: string, keyType: string, keyBase64: string): void {
     const line = `${hostIdent} ${keyType} ${keyBase64}\n`;
+    const dir = path.dirname(this.knownHostsPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    fs.appendFileSync(this.knownHostsPath, line, { mode: 0o600 });
+  }
+
+  private acceptNewHostKey(
+    hostIdent: string,
+    keyType: string,
+    keyBase64: string,
+    fingerprint: string
+  ): { status: 'new' | 'mismatch'; fingerprint: string; message: string } {
     try {
-      const dir = path.dirname(this.knownHostsPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      }
-      fs.appendFileSync(this.knownHostsPath, line, { mode: 0o644 });
-    } catch {
-      // Ignore write errors if permissions fail
+      this.addHostKey(hostIdent, keyType, keyBase64);
+      return {
+        status: 'new',
+        fingerprint,
+        message: `Permanently added '${hostIdent}' (${keyType}) to the list of known hosts.`
+      };
+    } catch (error) {
+      return {
+        status: 'mismatch',
+        fingerprint,
+        message: `Could not persist the host key for '${hostIdent}': ${(error as Error).message}`
+      };
     }
   }
 

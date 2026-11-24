@@ -13,6 +13,9 @@ import {
   SFTPClient,
   TunnelManager,
   parsePortForwardString,
+  parseOpenSSHConfig,
+  parseOpenSSHConfigFile,
+  calculateLevenshteinDistance,
   resolvePortablePath,
   toPortablePath
 } from '../dist/index.js';
@@ -21,6 +24,7 @@ import { TuiApp } from '../dist/tui/app.js';
 import { computeTableLayout } from '../dist/tui/screens/hosts.js';
 import { MockSSHServer } from './mock-server.ts';
 import { EventEmitter } from 'node:events';
+import { fileURLToPath } from 'node:url';
 
 let mockServer: MockSSHServer;
 let serverPort: number;
@@ -67,6 +71,51 @@ test('ConfigManager: adds, retrieves, updates and deletes host profile', () => {
   const deleted = configManager.deleteHost('test-server');
   assert.ok(deleted);
   assert.equal(configManager.getHost('test-server'), undefined);
+});
+
+test('ConfigManager: invalid app settings never silently reset host key policy', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-invalid-app-'));
+  try {
+    const manager = new ConfigManager(temporary);
+    const configFile = manager.getConfigFilePath();
+    manager.saveAppConfig({ strictHostKeyChecking: 'yes' });
+    assert.equal(manager.getAppConfig().strictHostKeyChecking, 'yes');
+    if (process.platform !== 'win32') assert.equal(fs.statSync(configFile).mode & 0o777, 0o600);
+
+    for (const invalid of ['{', 'null', '{"strictHostKeyChecking":"invalid"}']) {
+      fs.writeFileSync(configFile, invalid);
+      assert.throws(() => manager.getAppConfig(), /Invalid (JSON|app configuration)/);
+      assert.throws(() => manager.saveAppConfig({ theme: 'dark' }), /Invalid (JSON|app configuration)/);
+      assert.equal(fs.readFileSync(configFile, 'utf8'), invalid);
+    }
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('KnownHostsManager: unreadable known hosts cannot be treated as an empty trust store', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-invalid-known-hosts-'));
+  try {
+    const manager = new KnownHostsManager(temporary);
+    assert.throws(() => manager.getEntries(), /Could not read known hosts file/);
+    assert.throws(() => manager.verifyHostKey('example.test', 22, 'ssh-rsa', Buffer.from('host key')),
+      /Could not read known hosts file/);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('KnownHostsManager: accept-new refuses a host when its key cannot be persisted', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-unwritable-known-hosts-'));
+  try {
+    const manager = new KnownHostsManager(path.join(temporary, 'known_hosts'));
+    manager.addHostKey = () => { throw new Error('read-only filesystem'); };
+    const result = manager.verifyHostKey('example.test', 22, 'ssh-rsa', Buffer.from('host key'));
+    assert.equal(result.status, 'mismatch');
+    assert.match(result.message, /Could not persist the host key/);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
 });
 
 test('ConfigManager: portable path resolution and export/import', () => {
@@ -135,6 +184,34 @@ Host server-alpha
   assert.equal(importedSshHosts[0].username, 'admin');
 
   fs.rmSync(freshConfigDir, { recursive: true, force: true });
+});
+
+test('OpenSSH config string and file parsers agree on authentication directives', () => {
+  const contents = 'Host password-host\n  HostName example.test\n  PreferredAuthentications password,publickey\n  ServerAliveInterval 10\n';
+  const filename = path.join(tempConfigDir, 'ssh-auth-config');
+  fs.writeFileSync(filename, contents);
+
+  const expected = parseOpenSSHConfig(contents);
+  assert.equal(expected[0].authType, 'password');
+  assert.deepEqual(parseOpenSSHConfigFile(filename), expected);
+});
+
+test('OpenSSH config Include wildcard only imports matching files', () => {
+  const directory = path.join(tempConfigDir, 'ssh-include-files');
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'one.conf'), 'Host included-one\n');
+  fs.writeFileSync(path.join(directory, 'oneXconf'), 'Host excluded-one\n');
+  const configPath = path.join(tempConfigDir, 'ssh-included-config');
+  fs.writeFileSync(configPath, 'Include ssh-include-files/*.conf\n');
+
+  assert.deepEqual(parseOpenSSHConfigFile(configPath).map(host => host.name), ['included-one']);
+});
+
+test('Host suggestions compute edit distance without a quadratic matrix', () => {
+  assert.equal(calculateLevenshteinDistance('server', 'server'), 0);
+  assert.equal(calculateLevenshteinDistance('server', 'sever'), 1);
+  assert.equal(calculateLevenshteinDistance('db-primary', 'db-secondary'), 6);
+  assert.equal(calculateLevenshteinDistance('long-hostname', ''), 13);
 });
 
 test('KeyManager: generated keys parse and match the exported public keys', () => {
@@ -241,6 +318,96 @@ test('SSHConnection: stored password authenticates even when authType is private
   const result = await execCommand(conn.getRawClient(), 'echo saved');
   assert.ok(result.stdout.includes('echo saved'));
   conn.disconnect();
+});
+
+test('SSHConnection: ProxyCommand streams a connection to the SSH server', async () => {
+  const helperPath = fileURLToPath(new URL('./proxy-command-helper.ts', import.meta.url));
+  const proxyCommand = `node --import tsx "${helperPath}" ${serverPort}`;
+  const connection = new SSHConnection({
+    profile: {
+      id: 'proxy-command-test', name: 'proxy-command-test', host: '127.0.0.1', port: serverPort,
+      username: 'testuser', authType: 'password', password: 'testpass', proxyCommand
+    },
+    configManager,
+    knownHostsManager: testKnownHosts
+  });
+
+  try {
+    await connection.connect();
+    const result = await execCommand(connection.getRawClient(), 'echo proxy-command-ok');
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout.trim(), 'Executed: echo proxy-command-ok');
+  } finally {
+    connection.disconnect();
+  }
+});
+
+test('SSHConnection: reports ProxyCommand process failures', async () => {
+  const connection = new SSHConnection({
+    profile: {
+      id: 'proxy-command-failure-test', name: 'proxy-command-failure-test', host: '127.0.0.1', port: serverPort,
+      username: 'testuser', authType: 'password', password: 'testpass',
+      proxyCommand: 'node -e "process.exit(23)"'
+    },
+    configManager,
+    knownHostsManager: testKnownHosts
+  });
+
+  try {
+    await assert.rejects(connection.connect(), /ProxyCommand exited with status 23/);
+  } finally {
+    connection.disconnect();
+  }
+});
+
+test('SSHConnection: concurrent connect calls share the same handshake', async context => {
+  const profile = {
+    id: 'concurrent-test', name: 'concurrent-test', host: '127.0.0.1', port: serverPort,
+    username: 'testuser', authType: 'agent' as const
+  };
+  const connection = new SSHConnection({ profile, configManager, knownHostsManager: testKnownHosts });
+  const client = connection.getRawClient();
+  const connect = context.mock.method(client, 'connect', () => client);
+
+  const pending = [connection.connect(), connection.connect()];
+  assert.equal(connect.mock.callCount(), 1);
+  client.emit('ready');
+  await Promise.all(pending);
+  connection.disconnect();
+});
+
+test('SSHConnection: rejects ProxyJump cycles before opening a socket', async () => {
+  const first = configManager.addHost({
+    name: 'cycle-first', host: 'first.example.test', proxyJump: 'cycle-second'
+  });
+  const second = configManager.addHost({
+    name: 'cycle-second', host: 'second.example.test', proxyJump: first.id
+  });
+  const connection = new SSHConnection({ profile: first, configManager, knownHostsManager: testKnownHosts });
+  try {
+    await assert.rejects(connection.connect(), /ProxyJump cycle detected/);
+    assert.equal(connection.connected(), false);
+  } finally {
+    connection.disconnect();
+    configManager.deleteHost(first.id);
+    configManager.deleteHost(second.id);
+  }
+});
+
+test('SSHConnection: zero keepalive interval disables SSH2 keepalive', async context => {
+  const profile = {
+    id: 'no-keepalive', name: 'no-keepalive', host: '127.0.0.1', port: serverPort,
+    username: 'testuser', authType: 'agent' as const, keepaliveInterval: 0
+  };
+  const connection = new SSHConnection({ profile, configManager, knownHostsManager: testKnownHosts });
+  const client = connection.getRawClient();
+  const connect = context.mock.method(client, 'connect', () => client);
+
+  const pending = connection.connect();
+  assert.equal(connect.mock.calls[0].arguments[0].keepaliveInterval, 0);
+  client.emit('ready');
+  await pending;
+  connection.disconnect();
 });
 
 test('SSHConnection: handles a transport error after ready and closes before ready', async (context) => {

@@ -3,10 +3,12 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { encryptPayload, decryptPayload } from '../dist/sync/crypto.js';
+import http from 'node:http';
+import { once } from 'node:events';
+import { encryptPayload, decryptPayload, encryptPayloadAsync, decryptPayloadAsync } from '../dist/sync/crypto.js';
 import { SyncManager } from '../dist/sync/manager.js';
 import { ConfigManager } from '../dist/core/config.js';
-import type { SyncProvider } from '../dist/sync/provider.js';
+import { GistProvider, WebDavProvider, type SyncProvider } from '../dist/sync/provider.js';
 
 test('Sync Crypto: encrypts and decrypts payload correctly with AES-256-GCM', () => {
   const plaintext = JSON.stringify([{ name: 'prod', host: '10.0.0.1', password: 'my-secret-password' }]);
@@ -46,6 +48,24 @@ test('Sync Crypto: fails decryption on corrupted or tampered ciphertext', () => 
   }, /Decryption failed/);
 });
 
+test('Sync Crypto: async key derivation works with both existing and new encrypted backups', async () => {
+  const original = 'sensitive host configurations';
+  const legacy = encryptPayload(original, 'correct-passphrase');
+  assert.equal((await decryptPayloadAsync(legacy, 'correct-passphrase')).plaintext, original);
+  const asyncEncrypted = await encryptPayloadAsync(original, 'correct-passphrase', 1);
+  assert.equal(decryptPayload(asyncEncrypted, 'correct-passphrase').plaintext, original);
+  await assert.rejects(decryptPayloadAsync(asyncEncrypted, 'incorrect-passphrase'), /Decryption failed/);
+});
+
+test('Sync Crypto: rejects malformed metadata and invalid hex before deriving a key', async () => {
+  const valid = JSON.parse(encryptPayload('hosts', 'correct-passphrase'));
+  for (const changes of [{ kdf: 'untrusted' }, { salt: 'invalid' }, { iv: '00' }, { tag: '00' }, { ciphertext: '0g' }]) {
+    const invalid = JSON.stringify({ ...valid, ...changes });
+    assert.throws(() => decryptPayload(invalid, 'correct-passphrase'), /Invalid or unsupported encrypted payload/);
+    await assert.rejects(decryptPayloadAsync(invalid, 'correct-passphrase'), /Invalid or unsupported encrypted payload/);
+  }
+});
+
 test('SyncManager: saves and loads sync configuration', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-test-'));
   try {
@@ -70,8 +90,30 @@ test('SyncManager: saves and loads sync configuration', () => {
     assert.strictEqual(loaded.provider, 'webdav');
     assert.strictEqual(loaded.webdav?.username, 'alice');
     assert.strictEqual(loaded.passphrase, 'test-passphrase');
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(path.join(configMgr.getConfigDir(), 'sync.json')).mode & 0o777, 0o600);
+    }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SyncManager: reports corrupt configuration instead of treating it as unconfigured', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-invalid-config-'));
+  try {
+    const sync = new SyncManager(new ConfigManager(temporary));
+    const syncFile = path.join(temporary, 'sync.json');
+
+    for (const contents of ['{', '{"provider":"unknown"}', '{"provider":"gist"}']) {
+      fs.writeFileSync(syncFile, contents);
+      assert.throws(() => sync.getConfig(), /Invalid (JSON|sync configuration)/);
+    }
+
+    const previousContents = fs.readFileSync(syncFile, 'utf8');
+    assert.throws(() => sync.saveConfig({ provider: 'gist' }));
+    assert.equal(fs.readFileSync(syncFile, 'utf8'), previousContents);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
   }
 });
 
@@ -160,7 +202,10 @@ test('SyncManager: rejects corrupt or unreadable host configuration without uplo
   try {
     const config = new ConfigManager(temporary);
     const sync = new SyncManager(config);
-    sync.saveConfig({ provider: 'webdav', passphrase: 'test passphrase' });
+    sync.saveConfig({
+      provider: 'webdav', passphrase: 'test passphrase',
+      webdav: { url: 'https://mock.com', username: 'u', password: 'p' }
+    });
     const hostsFile = config.getHostsFilePath();
     let providerRequested = false;
     sync.getProvider = () => {
@@ -191,7 +236,10 @@ test('SyncManager: refuses ambiguous legacy profiles but can upload an explicitl
     const config = new ConfigManager(temporary);
     const sync = new SyncManager(config);
     const passphrase = 'test passphrase';
-    sync.saveConfig({ provider: 'webdav', passphrase });
+    sync.saveConfig({
+      provider: 'webdav', passphrase,
+      webdav: { url: 'https://mock.com', username: 'u', password: 'p' }
+    });
     let uploaded: string | undefined;
     sync.getProvider = () => ({
       name: 'memory',
@@ -295,5 +343,98 @@ test('ConfigManager: replacement and merge do not reuse old credentials after a 
     assert.strictEqual(rotated?.passphrase, undefined);
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('WebDAV provider aborts requests that exceed the configured timeout', async () => {
+  const server = http.createServer((_request, _response) => {
+    setTimeout(() => _response.end('late response'), 100);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const provider = new WebDavProvider({
+    url: `http://127.0.0.1:${address.port}`,
+    username: 'user',
+    password: 'password'
+  }, 20);
+
+  try {
+    await assert.rejects(provider.pull(), error =>
+      error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError'));
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('Gist push does not create a new backup when Gist lookup fails', async () => {
+  const originalFetch = globalThis.fetch;
+  let createRequested = false;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input).includes('/gists?per_page=100')) {
+      return new Response('server error', { status: 500 });
+    }
+    if (String(input) === 'https://api.github.com/gists') createRequested = true;
+    return new Response('unexpected request', { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const provider = new GistProvider({ token: 'test-token' }, 100);
+    await assert.rejects(provider.push('encrypted snapshot'), /Gist lookup failed/);
+    assert.equal(createRequested, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Gist push finds an existing backup on later pages instead of creating a duplicate', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    requests.push(url);
+    if (url === 'https://api.github.com/gists?per_page=100') {
+      return new Response('[]', {
+        headers: { link: '<https://api.github.com/gists?per_page=100&page=2>; rel="next"' }
+      });
+    }
+    if (url === 'https://api.github.com/gists?per_page=100&page=2') {
+      return Response.json([{ id: 'existing-backup', files: { 'sshx-hosts.enc': {} } }]);
+    }
+    if (url === 'https://api.github.com/gists/existing-backup') return Response.json({ id: 'existing-backup' });
+    return new Response('unexpected request', { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const provider = new GistProvider({ token: 'test-token' });
+    assert.equal((await provider.push('encrypted snapshot')).remoteId, 'existing-backup');
+    assert.deepEqual(requests, [
+      'https://api.github.com/gists?per_page=100',
+      'https://api.github.com/gists?per_page=100&page=2',
+      'https://api.github.com/gists/existing-backup'
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('WebDAV push refuses to continue after a network failure when creating a directory', async () => {
+  const originalFetch = globalThis.fetch;
+  let putRequested = false;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === 'MKCOL') throw new Error('WebDAV offline');
+    if (init?.method === 'PUT') putRequested = true;
+    return new Response('unexpected request', { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const provider = new WebDavProvider({ url: 'https://dav.example.test/sshx', username: 'u', password: 'p' });
+    await assert.rejects(provider.push('backup'), /WebDAV offline/);
+    assert.equal(putRequested, false);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });

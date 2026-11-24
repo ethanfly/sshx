@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ConfigManager, defaultConfigManager } from '../core/config.js';
-import { encryptPayload, decryptPayload } from './crypto.js';
+import { z } from 'zod';
+import { ConfigManager, defaultConfigManager, writePrivateFile } from '../core/config.js';
+import { encryptPayloadAsync, decryptPayloadAsync } from './crypto.js';
 import { SyncProvider, WebDavProvider, GistProvider, WebDavConfig, GistConfig } from './provider.js';
 
 export interface SyncConfig {
@@ -28,6 +29,31 @@ export interface SyncPullResult {
   remoteUpdatedAt?: string;
 }
 
+const syncConfigSchema = z.object({
+  provider: z.enum(['webdav', 'gist']),
+  passphrase: z.string().optional(),
+  savePassphrase: z.boolean().optional(),
+  lastSync: z.string().optional(),
+  webdav: z.object({
+    url: z.string().min(1),
+    username: z.string().min(1),
+    password: z.string(),
+    filename: z.string().optional()
+  }).optional(),
+  gist: z.object({
+    token: z.string().min(1),
+    gistId: z.string().optional(),
+    description: z.string().optional()
+  }).optional()
+}).superRefine((config, context) => {
+  if (config.provider === 'webdav' && !config.webdav) {
+    context.addIssue({ code: 'custom', message: 'WebDAV configuration is required.', path: ['webdav'] });
+  }
+  if (config.provider === 'gist' && !config.gist) {
+    context.addIssue({ code: 'custom', message: 'GitHub Gist configuration is required.', path: ['gist'] });
+  }
+});
+
 export class SyncManager {
   private syncFilePath: string;
 
@@ -36,27 +62,37 @@ export class SyncManager {
   }
 
   public getConfig(): SyncConfig | null {
-    if (!fs.existsSync(this.syncFilePath)) {
-      return null;
-    }
+    let data: string;
     try {
-      const data = fs.readFileSync(this.syncFilePath, 'utf8');
-      return JSON.parse(data) as SyncConfig;
-    } catch {
-      return null;
+      data = fs.readFileSync(this.syncFilePath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw new Error(`Could not read sync configuration '${this.syncFilePath}': ${(error as Error).message}`);
     }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      throw new Error(`Invalid JSON in sync configuration '${this.syncFilePath}'.`);
+    }
+    const result = syncConfigSchema.safeParse(parsed);
+    if (!result.success) {
+      const location = result.error.issues[0].path.join('.') || 'root';
+      throw new Error(`Invalid sync configuration '${this.syncFilePath}' (at ${location}).`);
+    }
+    return result.data;
   }
 
   public saveConfig(config: SyncConfig): void {
+    const validated = syncConfigSchema.parse(config);
     const dir = path.dirname(this.syncFilePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(this.syncFilePath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writePrivateFile(this.syncFilePath, JSON.stringify(validated, null, 2));
   }
 
   public getProvider(overrideConfig?: SyncConfig): SyncProvider {
-    const config = overrideConfig || this.getConfig();
+    const config = overrideConfig ? syncConfigSchema.parse(overrideConfig) : this.getConfig();
     if (!config) {
       throw new Error('Sync is not configured yet. Run "sshx sync setup" first.');
     }
@@ -72,7 +108,7 @@ export class SyncManager {
       }
       return new GistProvider(config.gist);
     } else {
-      throw new Error(`Unsupported sync provider: ${(config as any).provider}`);
+      throw new Error(`Unsupported sync provider: ${config.provider}`);
     }
   }
 
@@ -92,7 +128,7 @@ export class SyncManager {
 
     const { json, count } = this.configManager.exportHostSnapshot({ requireExisting: true });
 
-    const encryptedBlob = encryptPayload(json, resolvedPassphrase, count);
+    const encryptedBlob = await encryptPayloadAsync(json, resolvedPassphrase, count);
     const provider = this.getProvider(config);
 
     const pushRes = await provider.push(encryptedBlob);
@@ -131,7 +167,7 @@ export class SyncManager {
     const provider = this.getProvider(config);
     const encryptedBlob = await provider.pull();
 
-    const { plaintext, payload } = decryptPayload(encryptedBlob, resolvedPassphrase);
+    const { plaintext, payload } = await decryptPayloadAsync(encryptedBlob, resolvedPassphrase);
     const importRes = this.configManager.importHostsFromJson(plaintext, mode);
 
     config.lastSync = new Date().toISOString();
@@ -170,8 +206,8 @@ export class SyncManager {
     try {
       const provider = this.getProvider(config);
       connectivity = await provider.test();
-    } catch (err: any) {
-      connectivity = { ok: false, message: err.message || String(err) };
+    } catch (error) {
+      connectivity = { ok: false, message: error instanceof Error ? error.message : String(error) };
     }
 
     return {
