@@ -41,19 +41,24 @@ export class KeyManager {
     const comment = options.comment || `${os.userInfo().username}@${os.hostname()}`;
 
     if (keyType === 'ed25519') {
-      const pair = ssh2.utils.generateKeyPairSync('ed25519', {
-        comment,
-        ...(options.passphrase ? { passphrase: options.passphrase, cipher: 'aes256-ctr', rounds: 16 } : {})
-      });
-      const wireBuffer = Buffer.from(pair.public.split(' ', 2)[1], 'base64');
-      const fingerprintSha256 = `SHA256:${crypto.createHash('sha256').update(wireBuffer).digest('base64').replace(/=+$/, '')}`;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const pair = ssh2.utils.generateKeyPairSync('ed25519', {
+          comment,
+          ...(options.passphrase ? { passphrase: options.passphrase, cipher: 'aes256-ctr', rounds: 16 } : {})
+        });
+        const wireBuffer = Buffer.from(pair.public.split(' ', 2)[1], 'base64');
+        // ssh2 may strip leading zero bytes from a public key, producing an invalid key pair.
+        if (wireBuffer.length !== 4 + 11 + 4 + 32) continue;
 
-      return {
-        publicKeyOpenSSH: pair.public,
-        privateKeyPem: pair.private,
-        fingerprintSha256,
-        keyType: 'ed25519'
-      };
+        const fingerprintSha256 = `SHA256:${crypto.createHash('sha256').update(wireBuffer).digest('base64').replace(/=+$/, '')}`;
+        return {
+          publicKeyOpenSSH: pair.public,
+          privateKeyPem: pair.private,
+          fingerprintSha256,
+          keyType: 'ed25519'
+        };
+      }
+      throw new Error('Could not generate a valid Ed25519 key after eight attempts.');
     } else {
       const modulusLength = options.bits || 3072;
       const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {

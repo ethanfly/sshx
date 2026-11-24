@@ -319,6 +319,24 @@ test('KeyManager: generated keys parse and match the exported public keys', () =
   }
 });
 
+test('KeyManager: retries when ssh2 generates a malformed Ed25519 public key', () => {
+  const generate = ssh2.utils.generateKeyPairSync;
+  let calls = 0;
+  try {
+    ssh2.utils.generateKeyPairSync = ((...args: Parameters<typeof generate>) => {
+      calls++;
+      if (calls === 1) return { private: 'invalid', public: 'ssh-ed25519 AAA=' };
+      return generate(...args);
+    }) as typeof generate;
+
+    const key = KeyManager.generateKeyPair({ type: 'ed25519', comment: 'retry-test' });
+    assert.equal(calls, 2);
+    assert.ok(!(ssh2.utils.parseKey(key.privateKeyPem) instanceof Error));
+  } finally {
+    ssh2.utils.generateKeyPairSync = generate;
+  }
+});
+
 test('KeyManager: saves new key pairs without replacing existing files', () => {
   const keyPath = path.join(tempConfigDir, 'id_test_ed25519');
   const files = KeyManager.saveKeyPairToDisk(keyPath, { type: 'ed25519', comment: 'original-key' });
