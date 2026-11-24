@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import EventEmitter from 'node:events';
+import { Readable } from 'node:stream';
 import { Client, ClientChannel } from 'ssh2';
 
 export interface TerminalSize {
@@ -25,6 +26,10 @@ export class InteractiveSession extends EventEmitter {
   private recordStream?: fs.WriteStream;
   private recordStartTime: number = 0;
   private isActive: boolean = false;
+  private starting?: Promise<ClientChannel>;
+  private cancelStarting?: () => void;
+  private detachStream?: () => void;
+  private detachLocal?: () => void;
 
   constructor(client: Client, options: SessionOptions = {}) {
     super();
@@ -49,72 +54,141 @@ export class InteractiveSession extends EventEmitter {
    * Start the remote shell with PTY
    */
   public async start(): Promise<ClientChannel> {
+    if (this.starting) return this.starting;
     if (this.isActive) {
       throw new Error('Session is already active');
     }
-
-    // Init recording if requested (Asciinema v2 format)
-    if (this.options.recordFilePath) {
-      const recDir = path.dirname(path.resolve(this.options.recordFilePath));
-      if (!fs.existsSync(recDir)) {
-        fs.mkdirSync(recDir, { recursive: true });
-      }
-      this.recordStream = fs.createWriteStream(this.options.recordFilePath, { flags: 'w' });
-      this.recordStartTime = Date.now();
-
-      // Write Asciinema v2 header
-      const header = {
-        version: 2,
-        width: this.options.cols,
-        height: this.options.rows,
-        timestamp: Math.floor(this.recordStartTime / 1000),
-        env: { TERM: this.options.term, SHELL: '/bin/bash' }
+    const opening = new Promise<ClientChannel>((resolve, reject) => {
+      let settled = false;
+      const clearCancellation = () => {
+        if (this.cancelStarting === cancel) this.cancelStarting = undefined;
       };
-      this.recordStream.write(`${JSON.stringify(header)}\n`);
-    }
+      const cancel = () => {
+        if (settled) return;
+        settled = true;
+        clearCancellation();
+        reject(new Error('Session closed before shell startup completed'));
+      };
+      this.cancelStarting = cancel;
 
-    return new Promise<ClientChannel>((resolve, reject) => {
-      this.client.shell(
-        {
-          term: this.options.term,
-          rows: this.options.rows,
-          cols: this.options.cols
-        },
-        (err: Error | undefined, stream: ClientChannel) => {
-          if (err) return reject(err);
-
-          this.stream = stream;
-          this.isActive = true;
-
-          stream.on('data', (data: Buffer) => {
-            if (this.recordStream) {
-              const elapsed = (Date.now() - this.recordStartTime) / 1000;
-              this.recordStream.write(`${JSON.stringify([elapsed, 'o', data.toString('utf8')])}\n`);
+      try {
+        this.client.shell(
+          {
+            term: this.options.term,
+            rows: this.options.rows,
+            cols: this.options.cols
+          },
+          (err: Error | undefined, stream: ClientChannel) => {
+            if (settled) {
+              if (stream) this.closeStream(stream);
+              return;
             }
-            this.emit('data', data);
-          });
+            settled = true;
+            clearCancellation();
+            if (err) return reject(err);
 
-          stream.stderr.on('data', (data: Buffer) => {
-            this.emit('data', data);
-          });
-
-          stream.on('close', () => {
-            this.isActive = false;
-            if (this.recordStream) {
-              this.recordStream.end();
-              this.recordStream = undefined;
+            try {
+              this.openRecording();
+            } catch (error) {
+              this.closeStream(stream);
+              reject(error);
+              return;
             }
-            this.emit('close');
-          });
+            this.stream = stream;
+            this.isActive = true;
 
-          stream.on('error', (streamErr: Error) => {
-            this.emit('error', streamErr);
-          });
+            const onStdout = (data: Buffer) => this.forwardOutput(data, stream);
+            const onStderr = (data: Buffer) => this.forwardOutput(data, stream.stderr);
+            const onClose = () => this.finish();
+            const onError = (streamErr: Error) => this.fail(streamErr);
+            stream.on('data', onStdout);
+            stream.stderr.on('data', onStderr);
+            stream.once('close', onClose);
+            stream.on('error', onError);
+            this.detachStream = () => {
+              stream.removeListener('data', onStdout);
+              stream.stderr.removeListener('data', onStderr);
+              stream.removeListener('close', onClose);
+              stream.removeListener('error', onError);
+              this.detachStream = undefined;
+            };
 
-          resolve(stream);
-        }
-      );
+            resolve(stream);
+          }
+        );
+      } catch (error) {
+        settled = true;
+        clearCancellation();
+        reject(error);
+      }
     });
+    this.starting = opening;
+    try {
+      return await opening;
+    } finally {
+      if (this.starting === opening) this.starting = undefined;
+    }
+  }
+
+  private openRecording(): void {
+    if (!this.options.recordFilePath) return;
+    const recordingPath = path.resolve(this.options.recordFilePath);
+    fs.mkdirSync(path.dirname(recordingPath), { recursive: true });
+    const descriptor = fs.openSync(recordingPath, 'w', 0o600);
+    try {
+      fs.fchmodSync(descriptor, 0o600);
+    } catch (error) {
+      fs.closeSync(descriptor);
+      throw error;
+    }
+    this.recordStream = fs.createWriteStream(recordingPath, { fd: descriptor });
+    this.recordStream.on('error', (error: Error) => this.fail(error));
+    this.recordStartTime = Date.now();
+    const header = {
+      version: 2,
+      width: this.options.cols,
+      height: this.options.rows,
+      timestamp: Math.floor(this.recordStartTime / 1000),
+      env: { TERM: this.options.term, SHELL: '/bin/bash' }
+    };
+    this.recordStream.write(`${JSON.stringify(header)}\n`);
+  }
+
+  private forwardOutput(data: Buffer, source: Readable): void {
+    const recording = this.recordStream;
+    if (recording) {
+      const elapsed = (Date.now() - this.recordStartTime) / 1000;
+      const entry = `${JSON.stringify([elapsed, 'o', data.toString('utf8')])}\n`;
+      if (!recording.write(entry)) {
+        source.pause();
+        recording.once('drain', () => {
+          if (this.isActive && this.recordStream === recording) source.resume();
+        });
+      }
+    }
+    this.emit('data', data);
+  }
+
+  private finish(): void {
+    if (!this.isActive) return;
+    this.isActive = false;
+    this.detachStream?.();
+    this.stream = undefined;
+    const recording = this.recordStream;
+    this.recordStream = undefined;
+    if (recording && !recording.destroyed) recording.end();
+    this.emit('close');
+  }
+
+  private fail(error: Error): void {
+    if (!this.isActive) return;
+    try {
+      if (this.listenerCount('error') > 0) this.emit('error', error);
+      else process.emitWarning(error, { code: 'SSHX_SESSION_ERROR' });
+    } finally {
+      this.close();
+      this.finish();
+    }
   }
 
   /**
@@ -141,7 +215,7 @@ export class InteractiveSession extends EventEmitter {
    * Attach directly to process stdin and stdout in CLI mode
    */
   public attachToLocalProcess(): void {
-    if (!this.stream) return;
+    if (!this.isActive || this.detachLocal) return;
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -158,7 +232,8 @@ export class InteractiveSession extends EventEmitter {
       onResize();
     }
 
-    // Set raw mode for unbuffered keystrokes
+    const wasRaw = stdin.isRaw === true;
+    const wasPaused = typeof stdin.isPaused === 'function' && stdin.isPaused();
     if (stdin.isTTY) {
       stdin.setRawMode(true);
       stdin.resume();
@@ -170,29 +245,37 @@ export class InteractiveSession extends EventEmitter {
 
     stdin.on('data', onStdinData);
 
-    this.on('data', (chunk: Buffer) => {
+    const onSessionData = (chunk: Buffer) => {
       stdout.write(chunk);
-    });
+    };
+    this.on('data', onSessionData);
 
-    this.once('close', () => {
+    const detach = () => {
+      this.detachLocal = undefined;
       if (stdin.isTTY) {
-        stdin.setRawMode(false);
-        stdin.pause();
+        stdin.setRawMode(wasRaw);
+        if (wasPaused) stdin.pause();
       }
       stdin.removeListener('data', onStdinData);
+      this.removeListener('data', onSessionData);
       if (stdout.isTTY) {
         stdout.removeListener('resize', onResize);
       }
-    });
+    };
+    this.detachLocal = detach;
+    this.once('close', detach);
   }
 
   public close(): void {
-    if (this.stream) {
-      try {
-        this.stream.close();
-      } catch {
-        // ignore
-      }
+    this.cancelStarting?.();
+    if (this.stream) this.closeStream(this.stream);
+  }
+
+  private closeStream(stream: ClientChannel): void {
+    try {
+      stream.close();
+    } catch {
+      // ignore
     }
   }
 }

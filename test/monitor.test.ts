@@ -1,16 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { MetricsCollector, type ServerMetrics } from '../dist/core/metrics.js';
 import { SplitSession } from '../dist/core/split-session.js';
 import { SidebarRenderer, defaultSidebarTheme } from '../dist/tui/sidebar.js';
 import { padClip, stringWidth } from '../dist/tui/screen.js';
+import { InteractiveSession } from '../dist/core/session.js';
 
 function mockChannel() {
   return Object.assign(new EventEmitter(), {
     stderr: new EventEmitter(),
     setWindow() {},
-    write() {}
+    write() {},
+    close() {}
   });
 }
 
@@ -105,7 +110,16 @@ test('SplitSession: sidebar polling follows visibility and stops at session clos
 });
 
 test('SplitSession: redirected output disables sidebar polling and leaves hotkeys as input', async (context) => {
-  const input = Object.assign(new EventEmitter(), { isTTY: true, setRawMode() {}, pause() {}, resume() {} });
+  const rawModes: boolean[] = [];
+  const pauses = context.mock.fn();
+  const input = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    isRaw: false,
+    isPaused: () => true,
+    setRawMode: (raw: boolean) => rawModes.push(raw),
+    pause: pauses,
+    resume() {}
+  });
   const output = Object.assign(new EventEmitter(), { isTTY: false, columns: 110, rows: 30, write() {} });
   context.mock.getter(process, 'stdin', () => input as unknown as typeof process.stdin);
   context.mock.getter(process, 'stdout', () => output as unknown as typeof process.stdout);
@@ -129,6 +143,192 @@ test('SplitSession: redirected output disables sidebar polling and leaves hotkey
   } finally {
     channel.emit('close');
   }
+  assert.deepStrictEqual(rawModes, [true, false]);
+  assert.strictEqual(pauses.mock.callCount(), 1);
+});
+
+test('InteractiveSession: coalesces shell startup and cancels a pending startup on close', async () => {
+  const channel = mockChannel();
+  let shellCalls = 0;
+  const client = {
+    shell: (_options: unknown, callback: (error: Error | undefined, stream: ReturnType<typeof mockChannel>) => void) => {
+      shellCalls++;
+      callback(undefined, channel);
+    }
+  };
+  const session = new InteractiveSession(client as any);
+  const [first, second] = await Promise.all([session.start(), session.start()]);
+  assert.strictEqual(first, channel);
+  assert.strictEqual(second, channel);
+  assert.strictEqual(session.running(), true);
+  assert.strictEqual(shellCalls, 1);
+  channel.emit('close');
+
+  let finishStartup: ((error: Error | undefined, stream: ReturnType<typeof mockChannel>) => void) | undefined;
+  const pendingSession = new InteractiveSession({
+    shell(_options: unknown, callback: typeof finishStartup) {
+      finishStartup = callback;
+    }
+  } as any);
+  const opening = pendingSession.start();
+  pendingSession.close();
+  const pendingChannel = mockChannel();
+  finishStartup!(undefined, pendingChannel);
+  await assert.rejects(opening, /closed before shell startup completed/);
+  assert.strictEqual(pendingSession.running(), false);
+});
+
+test('InteractiveSession: closes the shell channel when recording cannot be initialized', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-session-recording-error-'));
+  const blocker = path.join(root, 'not-a-directory');
+  fs.writeFileSync(blocker, 'file');
+  const channel = mockChannel();
+  let closeCalls = 0;
+  channel.close = () => { closeCalls++; };
+  const session = new InteractiveSession({
+    shell(_options: unknown, callback: (error: undefined, stream: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any, { recordFilePath: path.join(blocker, 'session.cast') });
+
+  try {
+    await assert.rejects(session.start(), /EEXIST|not a directory/i);
+    assert.strictEqual(closeCalls, 1);
+    assert.strictEqual(session.running(), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('InteractiveSession: records output with owner-only file permissions', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-session-recording-success-'));
+  const recordingPath = path.join(root, 'session.cast');
+  const channel = mockChannel();
+  const session = new InteractiveSession({
+    shell(_options: unknown, callback: (error: undefined, stream: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any, { recordFilePath: recordingPath });
+
+  try {
+    await session.start();
+    channel.emit('data', Buffer.from('hello\n'));
+    const recording = (session as any).recordStream as fs.WriteStream;
+    const completed = new Promise<void>((resolve, reject) => {
+      recording.once('finish', resolve);
+      recording.once('error', reject);
+    });
+    channel.emit('close');
+    await completed;
+
+    const lines = fs.readFileSync(recordingPath, 'utf8').trim().split('\n');
+    assert.strictEqual(JSON.parse(lines[0]).version, 2);
+    assert.deepStrictEqual(JSON.parse(lines[1]).slice(1), ['o', 'hello\n']);
+    if (process.platform !== 'win32') assert.strictEqual(fs.statSync(recordingPath).mode & 0o777, 0o600);
+    assert.strictEqual(channel.listenerCount('data'), 0);
+    assert.strictEqual(channel.stderr.listenerCount('data'), 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('InteractiveSession: recording backpressure pauses and resumes SSH output', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-session-recording-backpressure-'));
+  const channel = mockChannel();
+  const paused: boolean[] = [];
+  channel.pause = () => { paused.push(true); };
+  channel.resume = () => { paused.push(false); };
+  const session = new InteractiveSession({
+    shell(_options: unknown, callback: (error: undefined, stream: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any, { recordFilePath: path.join(root, 'session.cast') });
+
+  try {
+    await session.start();
+    const recording = (session as any).recordStream as fs.WriteStream;
+    recording.write = () => false;
+    channel.emit('data', Buffer.from('output'));
+    assert.deepStrictEqual(paused, [true]);
+    recording.emit('drain');
+    assert.deepStrictEqual(paused, [true, false]);
+    channel.emit('close');
+  } finally {
+    channel.emit('close');
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('InteractiveSession: channel errors close the session before reporting failure', async () => {
+  const channel = mockChannel();
+  const session = new InteractiveSession({
+    shell(_options: unknown, callback: (error: undefined, stream: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any);
+  const closed = new Promise<void>(resolve => session.once('close', resolve));
+  let error: Error | undefined;
+  session.on('error', (value: Error) => { error = value; });
+
+  await session.start();
+  channel.emit('error', new Error('transport lost'));
+  await closed;
+  assert.strictEqual(session.running(), false);
+  assert.strictEqual(error?.message, 'transport lost');
+});
+
+test('InteractiveSession: shell startup failure does not create a recording file', async () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-session-recording-'));
+  const recordingPath = path.join(temporary, 'nested', 'session.cast');
+  const session = new InteractiveSession({
+    shell(_options: unknown, callback: (error: Error) => void) {
+      callback(new Error('shell unavailable'));
+    }
+  } as any, { recordFilePath: recordingPath });
+
+  try {
+    await assert.rejects(session.start(), /shell unavailable/);
+    assert.strictEqual(fs.existsSync(path.dirname(recordingPath)), false);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('InteractiveSession: local attachment is idempotent and restores terminal state', async (context) => {
+  const rawModes: boolean[] = [];
+  const pauses = context.mock.fn();
+  const input = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    isRaw: false,
+    isPaused: () => true,
+    setRawMode: (raw: boolean) => rawModes.push(raw),
+    pause: pauses,
+    resume() {}
+  });
+  const write = context.mock.fn((_chunk: Buffer) => true);
+  const output = Object.assign(new EventEmitter(), { isTTY: true, columns: 100, rows: 30, write });
+  context.mock.getter(process, 'stdin', () => input as unknown as typeof process.stdin);
+  context.mock.getter(process, 'stdout', () => output as unknown as typeof process.stdout);
+  const channel = mockChannel();
+  const session = new InteractiveSession({
+    shell(_options: unknown, callback: (error: undefined, stream: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any);
+
+  await session.start();
+  session.attachToLocalProcess();
+  session.attachToLocalProcess();
+  assert.strictEqual(input.listenerCount('data'), 1);
+  assert.strictEqual(session.listenerCount('data'), 1);
+  session.emit('data', Buffer.from('hello'));
+  assert.strictEqual(write.mock.callCount(), 1);
+
+  channel.emit('close');
+  assert.strictEqual(input.listenerCount('data'), 0);
+  assert.strictEqual(session.listenerCount('data'), 0);
+  assert.deepStrictEqual(rawModes, [true, false]);
+  assert.strictEqual(pauses.mock.callCount(), 1);
 });
 
 test('MetricsCollector: parses raw shell metrics output into structured ServerMetrics', () => {

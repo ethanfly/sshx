@@ -100,6 +100,8 @@ export class SplitSession {
     this.attached = true;
     const stdin = process.stdin;
     const stdout = process.stdout;
+    const wasRaw = stdin.isRaw === true;
+    const wasPaused = typeof stdin.isPaused === 'function' && stdin.isPaused();
 
     if (this.sidebarVisible && stdout.isTTY) {
       // Enter alternate screen buffer & clear to prevent previous terminal scrollback from showing
@@ -169,7 +171,7 @@ export class SplitSession {
     this.session.on('data', onSessionData);
 
     // Cleanup on session close
-    this.session.once('close', () => {
+    const detach = () => {
       this.isDestroyed = true;
       this.attached = false;
       this.updateMetricsPolling();
@@ -182,15 +184,16 @@ export class SplitSession {
       }
 
       if (stdin.isTTY) {
-        stdin.setRawMode(false);
-        stdin.pause();
+        stdin.setRawMode(wasRaw);
+        if (wasPaused) stdin.pause();
       }
       stdin.removeListener('data', onStdinData);
       this.session.removeListener('data', onSessionData);
       if (stdout.isTTY) {
         stdout.removeListener('resize', onResize);
       }
-    });
+    };
+    this.session.once('close', detach);
     this.updateMetricsPolling();
   }
 
