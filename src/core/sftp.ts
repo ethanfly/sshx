@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Client, SFTPWrapper } from 'ssh2';
+import { toError } from './errors.js';
 
 export interface RemoteFileInfo {
   filename: string;
@@ -224,7 +225,7 @@ export class SFTPClient {
               currentFile: path.basename(localPath)
             });
           } catch (error) {
-            finish(error instanceof Error ? error : new Error(String(error)));
+            finish(toError(error));
           }
         }
       });
@@ -338,7 +339,7 @@ export class SFTPClient {
               currentFile: path.posix.basename(remotePath)
             });
           } catch (error) {
-            readStream.destroy(error instanceof Error ? error : new Error(String(error)));
+            readStream.destroy(toError(error));
           }
         }
       });

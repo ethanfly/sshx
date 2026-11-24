@@ -4,6 +4,8 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 
 export interface KnownHostEntry {
+  /** Set for `@cert-authority` and `@revoked` lines */
+  marker?: KnownHostMarker;
   host: string;
   keyType: string;
   publicKey: string;
@@ -11,26 +13,15 @@ export interface KnownHostEntry {
   line: number;
 }
 
+export type KnownHostMarker = 'cert-authority' | 'revoked';
+
 export type StrictHostKeyChecking = 'yes' | 'no' | 'accept-new';
 
 export class KnownHostsManager {
   private knownHostsPath: string;
 
   constructor(customPath?: string) {
-    if (customPath) {
-      this.knownHostsPath = customPath;
-    } else {
-      const sshDir = path.join(os.homedir(), '.ssh');
-      if (fs.existsSync(sshDir)) {
-        this.knownHostsPath = path.join(sshDir, 'known_hosts');
-      } else {
-        const sshxDir = path.join(os.homedir(), '.sshx');
-        if (!fs.existsSync(sshxDir)) {
-          fs.mkdirSync(sshxDir, { recursive: true, mode: 0o700 });
-        }
-        this.knownHostsPath = path.join(sshxDir, 'known_hosts');
-      }
-    }
+    this.knownHostsPath = customPath || defaultKnownHostsPath();
   }
 
   public getFilePath(): string {
@@ -53,8 +44,15 @@ export class KnownHostsManager {
       if (!line || line.startsWith('#')) continue;
 
       const parts = line.split(/\s+/);
+      let marker: KnownHostMarker | undefined;
+      if (parts[0].startsWith('@')) {
+        const name = parts.shift()!.slice(1);
+        if (name !== 'cert-authority' && name !== 'revoked') continue;
+        marker = name;
+      }
       if (parts.length >= 2) {
         entries.push({
+          marker,
           host: parts[0],
           keyType: parts[1],
           publicKey: parts[2] || '',
@@ -74,7 +72,7 @@ export class KnownHostsManager {
       try {
         const typeLen = keyBuffer.readUInt32BE(0);
         if (typeLen > 0 && 4 + typeLen <= keyBuffer.length) {
-          const type = keyBuffer.slice(4, 4 + typeLen).toString('utf8');
+          const type = keyBuffer.subarray(4, 4 + typeLen).toString('utf8');
           if (/^[a-zA-Z0-9@.-]+$/.test(type)) {
             return type;
           }
@@ -98,7 +96,9 @@ export class KnownHostsManager {
   ): { status: 'trusted' | 'new' | 'mismatch'; fingerprint: string; message: string } {
     const keyBase64 = keyBuffer.toString('base64');
     const fingerprint = this.computeFingerprint(keyBuffer);
-    const hostIdent = port === 22 ? host : `[${host}]:${port}`;
+    // OpenSSH lowercases host names before matching, hashing and recording them.
+    const hostName = host.toLowerCase();
+    const hostIdent = port === 22 ? hostName : `[${hostName}]:${port}`;
 
     if (mode === 'no') {
       return {
@@ -108,15 +108,16 @@ export class KnownHostsManager {
       };
     }
 
-    const entries = this.getEntries();
-    const matchingEntries = entries.filter(e => {
-      const hosts = e.host.split(',');
-      if (port === 22) {
-        return hosts.includes(hostIdent) || hosts.includes(host) || this.matchesHashedHost(e.host, hostIdent);
-      } else {
-        return hosts.includes(hostIdent) || this.matchesHashedHost(e.host, hostIdent);
-      }
-    });
+    const hostEntries = this.getEntries().filter(e => this.matchesHost(e.host, hostIdent));
+    if (hostEntries.some(e => e.marker === 'revoked' && e.publicKey === keyBase64)) {
+      return {
+        status: 'mismatch',
+        fingerprint,
+        message: `Host key for '${hostIdent}' has been revoked in ${this.knownHostsPath}.`
+      };
+    }
+    // Certificate authorities sign host certificates; they never match a plain host key.
+    const matchingEntries = hostEntries.filter(e => !e.marker);
 
     if (matchingEntries.length === 0) {
       if (mode === 'accept-new') {
@@ -162,12 +163,17 @@ export class KnownHostsManager {
   }
 
   public addHostKey(hostIdent: string, keyType: string, keyBase64: string): void {
-    const line = `${hostIdent} ${keyType} ${keyBase64}\n`;
-    const dir = path.dirname(this.knownHostsPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.dirname(this.knownHostsPath), { recursive: true, mode: 0o700 });
+    const fd = fs.openSync(this.knownHostsPath, 'a+', 0o600);
+    try {
+      // A hand-edited file may lack its final newline; never glue the new key onto that entry.
+      const { size } = fs.fstatSync(fd);
+      const lastByte = Buffer.alloc(1);
+      const separator = size > 0 && fs.readSync(fd, lastByte, 0, 1, size - 1) === 1 && lastByte[0] !== 0x0a ? '\n' : '';
+      fs.writeSync(fd, `${separator}${hostIdent} ${keyType} ${keyBase64}\n`);
+    } finally {
+      fs.closeSync(fd);
     }
-    fs.appendFileSync(this.knownHostsPath, line, { mode: 0o600 });
   }
 
   private acceptNewHostKey(
@@ -197,6 +203,19 @@ export class KnownHostsManager {
     return `SHA256:${hash}`;
   }
 
+  /** OpenSSH host pattern lists: comma-separated, `*`/`?` wildcards, `!` negation, or one hashed name. */
+  private matchesHost(patterns: string, hostIdent: string): boolean {
+    if (patterns.startsWith('|')) return this.matchesHashedHost(patterns, hostIdent);
+    let matched = false;
+    for (const entry of patterns.toLowerCase().split(',')) {
+      const negated = entry.startsWith('!');
+      if (!matchesWildcard(hostIdent, negated ? entry.slice(1) : entry)) continue;
+      if (negated) return false;
+      matched = true;
+    }
+    return matched;
+  }
+
   private matchesHashedHost(hashedEntry: string, host: string): boolean {
     if (!hashedEntry.startsWith('|1|')) return false;
     const parts = hashedEntry.split('|');
@@ -212,4 +231,16 @@ export class KnownHostsManager {
       return false;
     }
   }
+}
+
+function defaultKnownHostsPath(): string {
+  const sshDir = path.join(os.homedir(), '.ssh');
+  if (fs.existsSync(sshDir)) return path.join(sshDir, 'known_hosts');
+  return path.join(os.homedir(), '.sshx', 'known_hosts');
+}
+
+function matchesWildcard(value: string, pattern: string): boolean {
+  if (!/[*?]/.test(pattern)) return value === pattern;
+  const source = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${source}$`).test(value);
 }

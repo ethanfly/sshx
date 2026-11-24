@@ -17,6 +17,7 @@ import {
   ConfigManager,
   KnownHostsManager,
   SSHConnection,
+  Tunnel,
   TunnelManager,
   parsePortForwardString
 } from '../dist/index.js';
@@ -217,6 +218,17 @@ test('Tunnel: remote forwarding removes its handler on stop and restart', async 
     assert.equal(client.listenerCount('tcp connection'), 0);
   }
   assert.equal(tunnel.getStats().activeConnections, 0);
+});
+
+test('Tunnel: a standalone tunnel reports start failures through its promise', async () => {
+  const client = Object.assign(new EventEmitter(), {
+    forwardIn(_host: string, _port: number, callback: (error: unknown) => void) { callback('administratively prohibited'); }
+  });
+  const tunnel = new Tunnel(client as unknown as Client, parsePortForwardString('12435:localhost:12436', 'remote'));
+
+  await assert.rejects(tunnel.start(), { message: 'administratively prohibited' });
+  assert.equal(tunnel.getStats().status, 'error');
+  assert.equal(tunnel.getStats().error, 'administratively prohibited');
 });
 
 test('Tunnel: remote forwarding stops locally after SSH has disconnected', async () => {

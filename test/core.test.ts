@@ -12,6 +12,7 @@ import {
   KeyManager,
   SSHConnection,
   execCommand,
+  expandProxyCommand,
   SFTPClient,
   TunnelManager,
   parsePortForwardString,
@@ -139,6 +140,23 @@ test('ConfigManager: changing a saved endpoint clears credentials and proxy sett
   }
 });
 
+test('ConfigManager: construction and reads have no filesystem side effects', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-lazy-config-'));
+  const configDir = path.join(temporary, 'config');
+  try {
+    const manager = new ConfigManager(configDir);
+    assert.deepEqual(manager.getHosts(), []);
+    assert.equal(manager.getHost('missing'), undefined);
+    assert.equal(fs.existsSync(configDir), false);
+
+    manager.addHost({ name: 'first', host: 'first.example.test' });
+    assert.deepEqual(fs.readdirSync(configDir), ['hosts.json']);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(configDir).mode & 0o777, 0o700);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 test('ConfigManager: exporting hosts atomically protects existing files with private permissions', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-export-hosts-'));
   const manager = new ConfigManager(path.join(temporary, 'config'));
@@ -194,6 +212,74 @@ test('KnownHostsManager: unreadable known hosts cannot be treated as an empty tr
       /Could not read known hosts file/);
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('KnownHostsManager: honours OpenSSH host patterns, revoked keys and CA markers', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-known-host-patterns-'));
+  try {
+    const file = path.join(temporary, 'known_hosts');
+    const [trusted, rotated, revoked, authority] = ['trusted', 'rotated', 'revoked', 'authority']
+      .map(name => Buffer.from(`host-key-${name}`));
+    const original = [
+      `*.corp.test,!bastion.corp.test ssh-ed25519 ${trusted.toString('base64')}`,
+      `[Build.Example.test]:2222 ssh-ed25519 ${trusted.toString('base64')}`,
+      `@revoked * ssh-ed25519 ${revoked.toString('base64')}`,
+      `@cert-authority *.ca.test ssh-ed25519 ${authority.toString('base64')}`,
+      ''
+    ].join('\n');
+    fs.writeFileSync(file, original);
+    const manager = new KnownHostsManager(file);
+    const verify = (host: string, port: number, key: Buffer, mode: 'yes' | 'accept-new' = 'yes') =>
+      manager.verifyHostKey(host, port, 'ssh-ed25519', key, mode);
+
+    assert.equal(verify('web.corp.test', 22, trusted).status, 'trusted');
+    assert.equal(verify('WEB.Corp.test', 22, trusted).status, 'trusted');
+    assert.equal(verify('build.example.test', 2222, trusted).status, 'trusted');
+    assert.match(verify('web.corp.test', 22, rotated, 'accept-new').message, /REMOTE HOST IDENTIFICATION HAS CHANGED/);
+    assert.match(verify('bastion.corp.test', 22, trusted).message, /is not known/);
+    assert.match(verify('node.ca.test', 22, authority).message, /is not known/);
+    const revokedResult = verify('fresh.example.test', 22, revoked, 'accept-new');
+    assert.equal(revokedResult.status, 'mismatch');
+    assert.match(revokedResult.message, /has been revoked/);
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+    assert.deepEqual(manager.getEntries().map(entry => entry.marker), [undefined, undefined, 'revoked', 'cert-authority']);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('KnownHostsManager: accept-new never glues a key onto a final line without a newline', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-known-host-newline-'));
+  try {
+    const file = path.join(temporary, 'known_hosts');
+    fs.writeFileSync(file, 'old.example.test ssh-ed25519 b2xk');
+    const manager = new KnownHostsManager(file);
+    assert.equal(manager.verifyHostKey('new.example.test', 22, 'ssh-ed25519', Buffer.from('new'), 'accept-new').status, 'new');
+    assert.deepEqual(manager.getEntries().map(entry => [entry.host, entry.publicKey]), [
+      ['old.example.test', 'b2xk'],
+      ['new.example.test', Buffer.from('new').toString('base64')]
+    ]);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('KnownHostsManager: constructing the default store does not touch the filesystem', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-known-host-home-'));
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const manager = new KnownHostsManager();
+    assert.equal(manager.getFilePath(), path.join(home, '.sshx', 'known_hosts'));
+    assert.deepEqual(fs.readdirSync(home), []);
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -376,6 +462,39 @@ test('SSHConnection: authenticates with a newly generated encrypted Ed25519 key'
   } finally {
     connection.disconnect();
   }
+});
+
+test('expandProxyCommand: expands OpenSSH tokens and refuses shell syntax in names', () => {
+  const profile = { host: 'Example.test', port: 2222, username: 'deploy' };
+  assert.equal(expandProxyCommand('nc %h %p # %r@%n %% %%h', profile), 'nc Example.test 2222 # deploy@Example.test % %h');
+  assert.equal(expandProxyCommand('nc %h %p', { host: 'fe80::1%eth0', username: 'u' }), 'nc fe80::1%eth0 22');
+  assert.equal(expandProxyCommand('nc %h %p', { ...profile, username: '$(id)' }), 'nc Example.test 2222');
+  for (const host of ['evil.test;touch pwned', 'evil.test$(id)', 'a b', '-oProxyCommand=x', 'line\nbreak']) {
+    assert.throws(() => expandProxyCommand('nc %h %p', { ...profile, host }), /contains shell metacharacters/);
+  }
+  assert.throws(() => expandProxyCommand('ssh -W %h:%p %r@jump', { ...profile, username: '`id`' }), /Refusing to expand %r/);
+});
+
+test('SSHConnection: expands %h/%p in ProxyCommand and never spawns it for unsafe host names', async () => {
+  const relay = "const s=require('net').connect(+process.argv[2],process.argv[1]);process.stdin.pipe(s).pipe(process.stdout)";
+  const proxyCommand = `"${process.execPath}" -e "${relay}" %h %p`;
+  const profile = {
+    id: 'proxied', name: 'proxied', host: '127.0.0.1', port: serverPort,
+    username: 'testuser', authType: 'password' as const, password: 'testpass', proxyCommand
+  };
+  const conn = new SSHConnection({ profile, configManager, knownHostsManager: testKnownHosts });
+  try {
+    await conn.connect();
+    const result = await execCommand(conn.getRawClient(), 'echo hello');
+    assert.equal(result.stdout.trim(), 'hello');
+  } finally {
+    conn.disconnect();
+  }
+
+  const unsafe = new SSHConnection({
+    profile: { ...profile, host: '127.0.0.1;touch pwned' }, configManager, knownHostsManager: testKnownHosts
+  });
+  await assert.rejects(unsafe.connect(), /contains shell metacharacters/);
 });
 
 test('SSHConnection & execCommand: connects to mock server and executes commands', async () => {

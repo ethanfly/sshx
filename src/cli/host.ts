@@ -3,6 +3,7 @@ import path from 'node:path';
 import { defaultConfigManager, DuplicateHostError, HostProfile, resolvePortablePath } from '../core/config.js';
 import { SSHConnection } from '../core/client.js';
 import { colors, prompt, renderTable } from './utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export interface HostListCliOptions {
   json?: boolean;
@@ -344,8 +345,8 @@ export async function runHostImport(filePath: string, options: { overwrite?: boo
   try {
     const res = defaultConfigManager.importHosts(filePath, options.overwrite ? 'overwrite' : 'merge');
     process.stdout.write(`${colors.green}✓ Successfully imported hosts: ${res.imported} new, ${res.updated} updated (Total: ${res.total})${colors.reset}\n`);
-  } catch (err: any) {
-    process.stderr.write(`${colors.red}Import failed: ${err.message || String(err)}${colors.reset}\n`);
+  } catch (err) {
+    process.stderr.write(`${colors.red}Import failed: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
 }

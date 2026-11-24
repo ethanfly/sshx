@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import EventEmitter from 'node:events';
 import { Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import { Client, ClientChannel } from 'ssh2';
 
 export interface TerminalSize {
@@ -25,6 +26,8 @@ export class InteractiveSession extends EventEmitter {
   private options: SessionOptions;
   private recordStream?: fs.WriteStream;
   private recordStartTime: number = 0;
+  /** One decoder per output stream so characters split across chunks stay intact. */
+  private recordDecoders = new Map<Readable, StringDecoder>();
   private isActive: boolean = false;
   private starting?: Promise<ClientChannel>;
   private cancelStarting?: () => void;
@@ -149,7 +152,8 @@ export class InteractiveSession extends EventEmitter {
       width: this.options.cols,
       height: this.options.rows,
       timestamp: Math.floor(this.recordStartTime / 1000),
-      env: { TERM: this.options.term, SHELL: '/bin/bash' }
+      // The remote login shell is unknown here, so only the negotiated terminal type is recorded.
+      env: { TERM: this.options.term }
     };
     this.recordStream.write(`${JSON.stringify(header)}\n`);
   }
@@ -157,9 +161,14 @@ export class InteractiveSession extends EventEmitter {
   private forwardOutput(data: Buffer, source: Readable): void {
     const recording = this.recordStream;
     if (recording) {
+      let decoder = this.recordDecoders.get(source);
+      if (!decoder) {
+        decoder = new StringDecoder('utf8');
+        this.recordDecoders.set(source, decoder);
+      }
+      const text = decoder.write(data);
       const elapsed = (Date.now() - this.recordStartTime) / 1000;
-      const entry = `${JSON.stringify([elapsed, 'o', data.toString('utf8')])}\n`;
-      if (!recording.write(entry)) {
+      if (text && !recording.write(`${JSON.stringify([elapsed, 'o', text])}\n`)) {
         source.pause();
         recording.once('drain', () => {
           if (this.isActive && this.recordStream === recording) source.resume();
@@ -176,6 +185,7 @@ export class InteractiveSession extends EventEmitter {
     this.stream = undefined;
     const recording = this.recordStream;
     this.recordStream = undefined;
+    this.recordDecoders.clear();
     if (recording && !recording.destroyed) recording.end();
     this.emit('close');
   }

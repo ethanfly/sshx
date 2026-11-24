@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { defaultSyncManager, SyncConfig } from '../sync/manager.js';
 import { WebDavProvider, GistProvider } from '../sync/provider.js';
 import { colors, prompt } from './utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export function registerSyncCommand(program: Command): void {
   const syncCmd = program
@@ -203,8 +204,8 @@ export async function runSyncPush(passphrase?: string): Promise<void> {
       process.stdout.write(`${colors.dim}Remote ID/URL: ${res.remoteId}${colors.reset}\n`);
     }
     process.stdout.write(`${colors.dim}Timestamp: ${res.updatedAt}${colors.reset}\n`);
-  } catch (err: any) {
-    process.stderr.write(`${colors.red}Sync push failed: ${err.message || String(err)}${colors.reset}\n`);
+  } catch (err) {
+    process.stderr.write(`${colors.red}Sync push failed: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
 }
@@ -231,8 +232,8 @@ export async function runSyncPull(passphrase?: string, mode: 'merge' | 'overwrit
     if (res.remoteUpdatedAt) {
       process.stdout.write(`${colors.dim}Remote timestamp: ${res.remoteUpdatedAt}${colors.reset}\n`);
     }
-  } catch (err: any) {
-    process.stderr.write(`${colors.red}Sync pull failed: ${err.message || String(err)}${colors.reset}\n`);
+  } catch (err) {
+    process.stderr.write(`${colors.red}Sync pull failed: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
 }

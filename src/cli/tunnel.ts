@@ -2,6 +2,7 @@ import { resolveTarget, ConnectCliOptions } from './connect.js';
 import { SSHConnection } from '../core/client.js';
 import { TunnelManager, parsePortForwardString } from '../core/tunnel.js';
 import { colors, formatBytes, renderTable } from './utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export interface TunnelCliOptions extends ConnectCliOptions {
   localForward?: string[];
@@ -13,8 +14,8 @@ export async function runTunnel(target: string, options: TunnelCliOptions = {}):
   let profile;
   try {
     profile = resolveTarget(target, options);
-  } catch (err: any) {
-    process.stderr.write(`${colors.red}Error: ${err.message || String(err)}${colors.reset}\n`);
+  } catch (err) {
+    process.stderr.write(`${colors.red}Error: ${errorMessage(err)}${colors.reset}\n`);
     process.exitCode = 1;
     return;
   }
@@ -81,9 +82,9 @@ export async function runTunnel(target: string, options: TunnelCliOptions = {}):
     }
     await closed;
     if (!userStopped) throw new Error('SSH connection closed unexpectedly');
-  } catch (err: any) {
+  } catch (err) {
     if (!userStopped) {
-      process.stderr.write(`${colors.red}Tunnel error: ${err.message || String(err)}${colors.reset}\n`);
+      process.stderr.write(`${colors.red}Tunnel error: ${errorMessage(err)}${colors.reset}\n`);
       process.exitCode = 1;
     }
   } finally {

@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { Client, ClientChannel, ConnectConfig, SyncHostVerifier } from 'ssh2';
 import { HostProfile, ConfigManager, defaultConfigManager, resolvePortablePath } from './config.js';
 import { KnownHostsManager } from './known-hosts.js';
+import { errorMessage, toError } from './errors.js';
 
 export type KeyboardInteractiveHandler = (
   name: string,
@@ -206,7 +207,7 @@ export class SSHConnection {
         this.socketsOpened = socket - 1;
         detach();
         this.cleanup();
-        fail(err instanceof Error ? err : new Error(String(err)));
+        fail(toError(err));
       }
     });
   }
@@ -301,12 +302,7 @@ export class SSHConnection {
   }
 
   private createProxyCommandSocket(command: string): Duplex {
-    // Replace %h and %p in proxycommand
-    const cmd = command
-      .replace(/%h/g, this.profile.host)
-      .replace(/%p/g, String(this.profile.port || 22));
-
-    const child = spawn(cmd, { shell: true, stdio: ['pipe', 'pipe', 'inherit'] });
+    const child = spawn(expandProxyCommand(command, this.profile), { shell: true, stdio: ['pipe', 'pipe', 'inherit'] });
     const duplex = new Duplex({
       read() {
         child.stdout.resume();
@@ -387,7 +383,7 @@ export class SSHConnection {
       return { success: true, latencyMs };
     } catch (err) {
       conn.disconnect();
-      return { success: false, latencyMs: -1, error: err instanceof Error ? err.message : String(err) };
+      return { success: false, latencyMs: -1, error: errorMessage(err) };
     }
   }
 }
@@ -407,4 +403,28 @@ function storedPasswordResponder(profile: HostProfile): KeyboardInteractiveHandl
   return (_name, _instructions, _lang, prompts, finish) => {
     finish(prompts.map(({ prompt, echo }) => (SECRET_PROMPT.test(prompt) || !echo ? password : '')));
   };
+}
+
+/** Characters OpenSSH refuses in names it substitutes into shell commands (CVE-2023-51385). */
+const SHELL_UNSAFE_NAME = /^-|['`"$\\;&<>|(){}\s\p{Cc}]/u;
+
+/**
+ * Expands the OpenSSH ProxyCommand tokens `%h`/`%n` (host), `%p` (port), `%r` (user) and `%%`.
+ * The command runs through a shell, so names that could inject shell syntax are rejected.
+ */
+export function expandProxyCommand(command: string, profile: Pick<HostProfile, 'host' | 'port' | 'username'>): string {
+  const values: Record<string, string> = {
+    '%': '%',
+    h: profile.host,
+    n: profile.host,
+    p: String(profile.port || 22),
+    r: profile.username
+  };
+  return command.replace(/%([%hnpr])/g, (_token, key: string) => {
+    const value = values[key];
+    if ((key === 'h' || key === 'n' || key === 'r') && SHELL_UNSAFE_NAME.test(value)) {
+      throw new Error(`Refusing to expand %${key} in ProxyCommand: '${value}' contains shell metacharacters.`);
+    }
+    return value;
+  });
 }

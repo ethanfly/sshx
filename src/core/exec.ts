@@ -1,5 +1,6 @@
 import { constants as osConstants } from 'node:os';
 import { Client, ClientChannel, ExecOptions as SshExecOptions } from 'ssh2';
+import { toError } from './errors.js';
 
 export interface ExecOptions {
   timeout?: number; // ms
@@ -101,7 +102,7 @@ export async function execCommand(
       }
       chunks.push(chunk);
       try { callback?.(chunk); } catch (callbackError) {
-        fail(callbackError instanceof Error ? callbackError : new Error(String(callbackError)));
+        fail(toError(callbackError));
       }
     };
 
@@ -158,12 +159,12 @@ export async function execCommand(
               inputStream.pipe(channel);
             }
           } catch (inputError) {
-            fail(inputError instanceof Error ? inputError : new Error(String(inputError)));
+            fail(toError(inputError));
           }
         }
       });
     } catch (error) {
-      fail(error instanceof Error ? error : new Error(String(error)));
+      fail(toError(error));
     }
   });
 }

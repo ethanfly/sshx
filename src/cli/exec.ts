@@ -3,6 +3,7 @@ import { SSHConnection } from '../core/client.js';
 import { HostProfile } from '../core/config.js';
 import { execCommand } from '../core/exec.js';
 import { colors } from './utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export interface ExecCliOptions extends ConnectCliOptions {
   json?: boolean;
@@ -19,8 +20,8 @@ export async function runExec(
   let profile: HostProfile;
   try {
     profile = resolveTarget(target, options);
-  } catch (err: any) {
-    process.stderr.write(`${colors.red}Error: ${err.message || String(err)}${colors.reset}\n`);
+  } catch (err) {
+    process.stderr.write(`${colors.red}Error: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
   const connection = new SSHConnection({ profile });
@@ -63,12 +64,12 @@ export async function runExec(
     }
 
     process.exitCode = result.exitCode;
-  } catch (err: any) {
+  } catch (err) {
     connection.disconnect();
     if (options.json) {
-      process.stdout.write(JSON.stringify({ error: err.message || String(err), exitCode: 1 }, null, 2) + '\n');
+      process.stdout.write(JSON.stringify({ error: errorMessage(err), exitCode: 1 }, null, 2) + '\n');
     } else {
-      process.stderr.write(`${colors.red}Exec error: ${err.message || String(err)}${colors.reset}\n`);
+      process.stderr.write(`${colors.red}Exec error: ${errorMessage(err)}${colors.reset}\n`);
     }
     process.exitCode = 1;
   }

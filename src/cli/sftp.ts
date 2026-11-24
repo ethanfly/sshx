@@ -4,6 +4,7 @@ import { resolveTarget, ConnectCliOptions } from './connect.js';
 import { SSHConnection } from '../core/client.js';
 import { SFTPClient, TransferProgress } from '../core/sftp.js';
 import { colors, formatBytes, renderTable } from './utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export interface SftpCliOptions extends ConnectCliOptions {
   recursive?: boolean;
@@ -27,9 +28,9 @@ export async function runSftpLs(target: string, remotePath: string = '.', option
     ]);
 
     process.stdout.write(renderTable(['Permissions', 'Size', 'Modified', 'Name'], rows) + '\n');
-  } catch (err: any) {
+  } catch (err) {
     conn.disconnect();
-    process.stderr.write(`${colors.red}SFTP error: ${err.message || String(err)}${colors.reset}\n`);
+    process.stderr.write(`${colors.red}SFTP error: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
 }
@@ -63,9 +64,9 @@ export async function runSftpGet(
     process.stdout.write(`\n${colors.green}✓ Download completed successfully: ${dest}${colors.reset}\n`);
 
     conn.disconnect();
-  } catch (err: any) {
+  } catch (err) {
     conn.disconnect();
-    process.stderr.write(`\n${colors.red}SFTP download error: ${err.message || String(err)}${colors.reset}\n`);
+    process.stderr.write(`\n${colors.red}SFTP download error: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
 }
@@ -104,9 +105,9 @@ export async function runSftpPut(
     process.stdout.write(`\n${colors.green}✓ Upload completed successfully: ${dest}${colors.reset}\n`);
 
     conn.disconnect();
-  } catch (err: any) {
+  } catch (err) {
     conn.disconnect();
-    process.stderr.write(`\n${colors.red}SFTP upload error: ${err.message || String(err)}${colors.reset}\n`);
+    process.stderr.write(`\n${colors.red}SFTP upload error: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
 }
@@ -121,9 +122,9 @@ export async function runSftpRm(target: string, remotePath: string, options: Sft
     await sftp.rm(remotePath, options.recursive ?? false);
     conn.disconnect();
     process.stdout.write(`${colors.green}✓ Removed: ${remotePath}${colors.reset}\n`);
-  } catch (err: any) {
+  } catch (err) {
     conn.disconnect();
-    process.stderr.write(`${colors.red}SFTP rm error: ${err.message || String(err)}${colors.reset}\n`);
+    process.stderr.write(`${colors.red}SFTP rm error: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
 }

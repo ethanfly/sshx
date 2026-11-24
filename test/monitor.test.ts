@@ -232,6 +232,40 @@ test('InteractiveSession: records output with owner-only file permissions', asyn
   }
 });
 
+test('InteractiveSession: recording keeps UTF-8 characters split across chunks', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-session-recording-utf8-'));
+  const recordingPath = path.join(root, 'session.cast');
+  const channel = mockChannel();
+  const session = new InteractiveSession({
+    shell(_options: unknown, callback: (error: undefined, stream: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  } as any, { recordFilePath: recordingPath });
+
+  try {
+    await session.start();
+    const text = Buffer.from('你好');
+    const emoji = Buffer.from('🔑');
+    channel.emit('data', text.subarray(0, 4));
+    channel.stderr.emit('data', emoji.subarray(0, 2));
+    channel.emit('data', text.subarray(4));
+    channel.stderr.emit('data', emoji.subarray(2));
+    const recording = (session as any).recordStream as fs.WriteStream;
+    const completed = new Promise<void>((resolve, reject) => {
+      recording.once('finish', resolve);
+      recording.once('error', reject);
+    });
+    channel.emit('close');
+    await completed;
+
+    const [header, ...lines] = fs.readFileSync(recordingPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.deepStrictEqual(Object.keys(header.env), ['TERM']);
+    assert.deepStrictEqual(lines.map(event => event[2]), ['你', '好', '🔑']);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('InteractiveSession: recording backpressure pauses and resumes SSH output', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-session-recording-backpressure-'));
   const channel = mockChannel();

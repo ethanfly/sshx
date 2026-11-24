@@ -8,6 +8,7 @@ import { InteractiveSession } from '../core/session.js';
 import { SplitSession } from '../core/split-session.js';
 import { TunnelManager, parsePortForwardString } from '../core/tunnel.js';
 import { colors, prompt } from './utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export interface ConnectCliOptions {
   port?: number | string;
@@ -174,7 +175,7 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
   let profile: HostProfile;
   try {
     profile = resolveTarget(target, options);
-  } catch (err: any) {
+  } catch (err) {
     if (err instanceof TargetNotFoundError) {
       process.stderr.write(`${colors.red}Error: ${err.message}${colors.reset}\n`);
       if (options.noExitOnError) throw err;
@@ -239,8 +240,8 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
         splitSession.attachToLocalProcess();
       });
     }
-  } catch (err: any) {
-    process.stderr.write(`${colors.red}Connection failed: ${err.message || String(err)}${colors.reset}\n`);
+  } catch (err) {
+    process.stderr.write(`${colors.red}Connection failed: ${errorMessage(err)}${colors.reset}\n`);
     if (options.noExitOnError) {
       throw err;
     }

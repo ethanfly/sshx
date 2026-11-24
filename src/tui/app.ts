@@ -7,6 +7,7 @@ import { runConnect } from '../cli/connect.js';
 import { defaultConfigManager, HostProfile } from '../core/config.js';
 import { defaultSyncManager } from '../sync/manager.js';
 import { colors } from '../cli/utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export interface TuiOptions {
   search?: string;
@@ -53,8 +54,8 @@ export class TuiApp {
           return;
         }
         if (this.running && !this.inModal) this.render();
-      } catch (err: any) {
-        this.hostsScreen.statusMessage = err?.message || String(err);
+      } catch (err) {
+        this.hostsScreen.statusMessage = errorMessage(err);
         if (this.running) this.render();
       }
     };
@@ -290,8 +291,8 @@ export class TuiApp {
       const res = await defaultSyncManager.pull();
       this.hostsScreen.refreshHosts();
       this.hostsScreen.statusMessage = `synced ${res.total} hosts (${res.imported} new, ${res.updated} updated)`;
-    } catch (err: any) {
-      this.hostsScreen.statusMessage = `sync failed: ${err.message || String(err)}`;
+    } catch (err) {
+      this.hostsScreen.statusMessage = `sync failed: ${errorMessage(err)}`;
     }
   }
 
@@ -302,7 +303,7 @@ export class TuiApp {
       this.suspendForConnection();
       this.screen.exitAltScreen();
       await runConnect(host.id, { noExitOnError: true });
-    } catch (err: any) {
+    } catch (err) {
       process.stdout.write(`\n${colors.yellow}Press any key to return to sshx...${colors.reset}`);
       if (process.stdin.isTTY) {
         await new Promise<void>((resolve) => {
@@ -311,7 +312,7 @@ export class TuiApp {
           process.stdin.once('data', () => resolve());
         });
       }
-      this.hostsScreen.statusMessage = `Connection failed: ${err?.message || err}`;
+      this.hostsScreen.statusMessage = `Connection failed: ${errorMessage(err)}`;
     } finally {
       this.resumeAfterConnection();
       this.screen.updateDimensions();

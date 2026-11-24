@@ -156,8 +156,6 @@ export class ConfigManager {
     this.hostsFilePath = envHostsFile ? resolvePortablePath(envHostsFile) : path.join(this.configDir, 'hosts.json');
     this.configFilePath = envConfigFile ? resolvePortablePath(envConfigFile) : path.join(this.configDir, 'config.json');
     this.keysDir = path.join(this.configDir, 'keys');
-
-    this.ensureDirs();
   }
 
   public getConfigDir(): string {
@@ -176,23 +174,6 @@ export class ConfigManager {
     return this.keysDir;
   }
 
-  private ensureDirs(): void {
-    if (!fs.existsSync(this.configDir)) {
-      fs.mkdirSync(this.configDir, { recursive: true, mode: 0o700 });
-    }
-    const hostsDir = path.dirname(this.hostsFilePath);
-    if (!fs.existsSync(hostsDir)) {
-      fs.mkdirSync(hostsDir, { recursive: true, mode: 0o700 });
-    }
-    const configDir = path.dirname(this.configFilePath);
-    if (!fs.existsSync(configDir)) {
-      fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
-    }
-    if (!fs.existsSync(this.keysDir)) {
-      fs.mkdirSync(this.keysDir, { recursive: true, mode: 0o700 });
-    }
-  }
-
   public getDefaultAppConfig(): AppConfig {
     return {
       defaultPort: 22,
@@ -207,7 +188,6 @@ export class ConfigManager {
   }
 
   public getAppConfig(): AppConfig {
-    this.ensureDirs();
     let raw: string;
     try {
       raw = fs.readFileSync(this.configFilePath, 'utf8');
@@ -240,13 +220,11 @@ export class ConfigManager {
   public saveAppConfig(config: Partial<AppConfig>): AppConfig {
     const current = fs.existsSync(this.configFilePath) ? this.getAppConfig() : this.getDefaultAppConfig();
     const updated = appConfigSchema.parse({ ...current, ...config });
-    this.ensureDirs();
     writePrivateFile(this.configFilePath, JSON.stringify(updated, null, 2));
     return updated;
   }
 
   public getHosts(options: { requireExisting?: boolean } = {}): HostProfile[] {
-    this.ensureDirs();
     let raw: string;
     try {
       raw = fs.readFileSync(this.hostsFilePath, 'utf8');
@@ -274,7 +252,6 @@ export class ConfigManager {
   }
 
   public saveHosts(hosts: HostProfile[]): void {
-    this.ensureDirs();
     const data = JSON.stringify(hostListSchema.parse(hosts), null, 2);
     writePrivateFile(this.hostsFilePath, data);
   }
@@ -437,10 +414,7 @@ export class ConfigManager {
   public exportHosts(exportPath?: string): string {
     const { json } = this.exportHostSnapshot();
     if (exportPath) {
-      const resolved = resolvePortablePath(exportPath);
-      const dir = path.dirname(resolved);
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      writePrivateFile(resolved, json);
+      writePrivateFile(resolvePortablePath(exportPath), json);
     }
     return json;
   }
@@ -540,7 +514,9 @@ export class ConfigManager {
   }
 }
 
+/** Atomically replace `filePath` with owner-only permissions, creating private parent directories. */
 export function writePrivateFile(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporary = `${filePath}.${randomUUID()}.tmp`;
   const descriptor = fs.openSync(temporary, 'wx', 0o600);
   try {

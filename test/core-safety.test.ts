@@ -10,6 +10,7 @@ import { Readable, Writable } from 'node:stream';
 import type { Client, ClientChannel, SFTPWrapper } from 'ssh2';
 import { execCommand, SFTPClient } from '../dist/index.js';
 import { createLinePrompter, readHiddenInput } from '../dist/cli/utils.js';
+import { errorMessage, toError } from '../dist/core/errors.js';
 
 function makeExecClient() {
   const channel = new EventEmitter();
@@ -747,4 +748,15 @@ test('createLinePrompter: answers successive prompts from one piped input and fa
   await assert.rejects(ask('5: '), /Input ended before all prompts were answered/);
   assert.equal(written, '1: 2: 3: 4: 5: ');
   assert.equal(input.listenerCount('data'), 0);
+});
+
+test('errorMessage and toError normalize any thrown value', () => {
+  assert.equal(errorMessage(new Error('boom')), 'boom');
+  assert.equal(errorMessage(new TypeError('')), 'TypeError');
+  assert.equal(errorMessage({ message: 'plain object' }), 'plain object');
+  assert.equal(errorMessage(undefined), 'undefined');
+  assert.equal(errorMessage(null), 'null');
+  const original = new Error('kept');
+  assert.equal(toError(original), original);
+  assert.deepEqual([toError('text') instanceof Error, toError('text').message], [true, 'text']);
 });

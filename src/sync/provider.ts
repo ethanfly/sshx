@@ -1,3 +1,4 @@
+import { errorMessage } from '../core/errors.js';
 export interface SyncProvider {
   name: string;
   test(): Promise<{ ok: boolean; message: string }>;
@@ -73,8 +74,8 @@ export class WebDavProvider implements SyncProvider {
       }
 
       return { ok: false, message: `WebDAV returned status ${res.status} ${res.statusText}` };
-    } catch (err: any) {
-      return { ok: false, message: `WebDAV connection error: ${err.message || String(err)}` };
+    } catch (err) {
+      return { ok: false, message: `WebDAV connection error: ${errorMessage(err)}` };
     }
   }
 
@@ -138,6 +139,19 @@ export class GistProvider implements SyncProvider {
     return fetchWithTimeout(input, init, this.requestTimeoutMs);
   }
 
+  /** Explains a rejected Gist write, including GitHub's own reason when the response carries one. */
+  private static async writeError(res: Response, failure: string): Promise<Error> {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const reason = (await res.json() as { message?: unknown } | null)?.message;
+      if (typeof reason === 'string' && reason) detail += `: ${reason}`;
+    } catch {}
+    if (res.status === 403) {
+      return new Error(`GitHub token lacks Gist write permission (${detail}). Please ensure your token has 'gist' (Classic) or Account -> Gists write access (Fine-grained).`);
+    }
+    return new Error(`${failure} (${detail})`);
+  }
+
   private get headers(): Record<string, string> {
     return {
       Authorization: `Bearer ${this.config.token}`,
@@ -182,8 +196,8 @@ export class GistProvider implements SyncProvider {
       }
 
       return { ok: false, message: `GitHub API error: ${res.status} ${res.statusText}` };
-    } catch (err: any) {
-      return { ok: false, message: `GitHub connection failed: ${err.message || String(err)}` };
+    } catch (err) {
+      return { ok: false, message: `GitHub connection failed: ${errorMessage(err)}` };
     }
   }
 
@@ -269,15 +283,7 @@ export class GistProvider implements SyncProvider {
         // Gist was not found (invalid ID or deleted). Auto-fallback to create a new secret Gist below.
         gistId = undefined;
       } else {
-        let msg = `${res.status} ${res.statusText}`;
-        try {
-          const errData = await res.json() as any;
-          if (errData?.message) msg += `: ${errData.message}`;
-        } catch {}
-        if (res.status === 403) {
-          throw new Error(`GitHub token lacks Gist write permission (${msg}). Please ensure your token has 'gist' (Classic) or Account -> Gists write access (Fine-grained).`);
-        }
-        throw new Error(`Failed to update Gist ${gistId} (${msg})`);
+        throw await GistProvider.writeError(res, `Failed to update Gist ${gistId}`);
       }
     }
 
@@ -295,15 +301,7 @@ export class GistProvider implements SyncProvider {
     });
 
     if (!res.ok) {
-      let msg = `${res.status} ${res.statusText}`;
-      try {
-        const errData = await res.json() as any;
-        if (errData?.message) msg += `: ${errData.message}`;
-      } catch {}
-      if (res.status === 403) {
-        throw new Error(`GitHub token lacks Gist write permission (${msg}). Please ensure your token has 'gist' (Classic) or Account -> Gists write access (Fine-grained).`);
-      }
-      throw new Error(`Failed to create secret Gist (${msg})`);
+      throw await GistProvider.writeError(res, 'Failed to create secret Gist');
     }
 
     const created: unknown = await res.json();

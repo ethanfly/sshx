@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { ConfigManager, defaultConfigManager, writePrivateFile } from '../core/config.js';
 import { encryptPayloadAsync, decryptPayloadAsync } from './crypto.js';
 import { SyncProvider, WebDavProvider, GistProvider, WebDavConfig, GistConfig } from './provider.js';
+import { errorMessage } from '../core/errors.js';
 
 export interface SyncConfig {
   provider: 'webdav' | 'gist';
@@ -86,8 +87,6 @@ export class SyncManager {
 
   public saveConfig(config: SyncConfig): void {
     const validated = syncConfigSchema.parse(config);
-    const dir = path.dirname(this.syncFilePath);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     writePrivateFile(this.syncFilePath, JSON.stringify(validated, null, 2));
   }
 
@@ -207,7 +206,7 @@ export class SyncManager {
       const provider = this.getProvider(config);
       connectivity = await provider.test();
     } catch (error) {
-      connectivity = { ok: false, message: error instanceof Error ? error.message : String(error) };
+      connectivity = { ok: false, message: errorMessage(error) };
     }
 
     return {

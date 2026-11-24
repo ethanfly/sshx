@@ -26,9 +26,11 @@ test('MCP: creates server with SSH tools registered', () => {
   const mcp = createMcpServer();
   assert.ok(mcp);
 
-  // Check registered tools via server instance
-  const server = (mcp as any).server;
-  assert.ok(server);
+  assert.deepEqual(Object.keys((mcp as any)._registeredTools).sort(), [
+    'ssh_add_host', 'ssh_delete_host', 'ssh_download_file', 'ssh_exec', 'ssh_generate_key', 'ssh_get_host',
+    'ssh_list_hosts', 'ssh_list_keys', 'ssh_sftp_list', 'ssh_system_info', 'ssh_test_connection',
+    'ssh_update_host', 'ssh_upload_file'
+  ]);
 });
 
 test('MCP: reports the installed package version', async () => {
@@ -96,6 +98,29 @@ test('MCP: ssh_add_host and ssh_list_hosts manages host profiles', async () => {
   assert.ok(delRes.content[0].text.includes('Deleted'));
   const missing = await tools['ssh_get_host'].handler({ host: 'mcp-prod' });
   assert.equal(missing.isError, true);
+});
+
+test('MCP: tools report failures as tool errors and validate input before connecting', async () => {
+  const tools = (createMcpServer() as any)._registeredTools;
+  const added = await tools['ssh_add_host'].handler({ name: 'mcp-duplicate', host: '10.0.0.6', username: 'admin' });
+  assert.equal(added.isError, undefined);
+  try {
+    const duplicate = await tools['ssh_add_host'].handler({ name: 'mcp-duplicate', host: '10.0.0.7', username: 'admin' });
+    assert.equal(duplicate.isError, true);
+    assert.match(duplicate.content[0].text, /already exists/);
+  } finally {
+    await tools['ssh_delete_host'].handler({ host: 'mcp-duplicate' });
+  }
+
+  const missing = await tools['ssh_delete_host'].handler({ host: 'mcp-duplicate' });
+  assert.equal(missing.isError, true);
+  assert.match(missing.content[0].text, /not found/);
+
+  const upload = await tools['ssh_upload_file'].handler({ host: 'nobody@127.0.0.1:1', remotePath: '/tmp/unused' });
+  assert.deepEqual(upload, {
+    isError: true,
+    content: [{ type: 'text', text: 'SFTP upload failed: Either content or localPath must be provided' }]
+  });
 });
 
 test('MCP: ssh_exec executes command on mock SSH server', async () => {

@@ -1,5 +1,6 @@
 import { SkillTools } from './tools.js';
 import { colors } from '../cli/utils.js';
+import { errorMessage } from '../core/errors.js';
 
 export async function runSkillCli(subcommand?: string, args: string[] = []): Promise<void> {
   if (!subcommand || subcommand === 'help') {
@@ -80,8 +81,8 @@ export async function runSkillCli(subcommand?: string, args: string[] = []): Pro
         printSkillHelp();
         process.exit(1);
     }
-  } catch (err: any) {
-    process.stderr.write(JSON.stringify({ error: err.message || String(err) }, null, 2) + '\n');
+  } catch (err) {
+    process.stderr.write(JSON.stringify({ error: errorMessage(err) }, null, 2) + '\n');
     process.exit(1);
   }
 }

@@ -20,6 +20,7 @@ import { registerSyncCommand } from './sync.js';
 import { startTUI, TuiOptions } from '../tui/index.js';
 import { startMcpServer } from '../skill/mcp-server.js';
 import { runSkillCli } from '../skill/runner.js';
+import { errorMessage } from '../core/errors.js';
 
 export function createCli(): Command {
   const program = new Command();
@@ -350,7 +351,7 @@ const isDirectCli = process.argv[1] && (
 if (isDirectCli) {
   const program = createCli();
   program.parseAsync(process.argv).catch((err) => {
-    process.stderr.write(`Fatal error: ${err.message || String(err)}\n`);
+    process.stderr.write(`Fatal error: ${errorMessage(err)}\n`);
     process.exit(1);
   });
 }

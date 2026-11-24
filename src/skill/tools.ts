@@ -7,6 +7,25 @@ import { SFTPClient } from '../core/sftp.js';
 import { KeyManager, KeyPairResult } from '../core/keygen.js';
 import { resolveTarget } from '../cli/connect.js';
 
+/** Opens one SSH connection for `work` and always closes it afterwards. */
+async function withConnection<T>(
+  hostOrTarget: string,
+  work: (connection: SSHConnection, profile: HostProfile) => Promise<T>
+): Promise<T> {
+  const profile = resolveTarget(hostOrTarget);
+  const connection = new SSHConnection({ profile });
+  try {
+    await connection.connect();
+    return await work(connection, profile);
+  } finally {
+    connection.disconnect();
+  }
+}
+
+function withSftp<T>(hostOrTarget: string, work: (sftp: SFTPClient) => Promise<T>): Promise<T> {
+  return withConnection(hostOrTarget, connection => work(new SFTPClient(connection.getRawClient())));
+}
+
 export class SkillTools {
   /**
    * List all saved host profiles
@@ -97,32 +116,21 @@ export class SkillTools {
   /**
    * Execute command remotely
    */
-  public static async exec(
+  public static exec(
     hostOrTarget: string,
     command: string,
     options: { timeout?: number; env?: Record<string, string> } = {}
   ): Promise<{ stdout: string; stderr: string; exitCode: number; durationMs: number }> {
-    const profile = resolveTarget(hostOrTarget);
-    const conn = new SSHConnection({ profile });
-
-    try {
-      await conn.connect();
-      const res = await execCommand(conn.getRawClient(), command, {
-        timeout: options.timeout ? options.timeout * 1000 : 30000,
-        env: options.env
-      });
-      conn.disconnect();
-      return res;
-    } catch (err: any) {
-      conn.disconnect();
-      throw err;
-    }
+    return withConnection(hostOrTarget, connection => execCommand(connection.getRawClient(), command, {
+      timeout: options.timeout ? options.timeout * 1000 : 30000,
+      env: options.env
+    }));
   }
 
   /**
    * List remote directory via SFTP
    */
-  public static async sftpList(hostOrTarget: string, remotePath: string = '.'): Promise<Array<{
+  public static sftpList(hostOrTarget: string, remotePath: string = '.'): Promise<Array<{
     name: string;
     path: string;
     isDirectory: boolean;
@@ -130,26 +138,14 @@ export class SkillTools {
     permissions: string;
     modified: string;
   }>> {
-    const profile = resolveTarget(hostOrTarget);
-    const conn = new SSHConnection({ profile });
-
-    try {
-      await conn.connect();
-      const sftp = new SFTPClient(conn.getRawClient());
-      const files = await sftp.list(remotePath);
-      conn.disconnect();
-      return files.map(f => ({
-        name: f.filename,
-        path: f.path,
-        isDirectory: f.isDirectory,
-        size: f.size,
-        permissions: f.modeString,
-        modified: f.modifyTime.toISOString()
-      }));
-    } catch (err: any) {
-      conn.disconnect();
-      throw err;
-    }
+    return withSftp(hostOrTarget, async sftp => (await sftp.list(remotePath)).map(f => ({
+      name: f.filename,
+      path: f.path,
+      isDirectory: f.isDirectory,
+      size: f.size,
+      permissions: f.modeString,
+      modified: f.modifyTime.toISOString()
+    })));
   }
 
   /**
@@ -160,69 +156,44 @@ export class SkillTools {
     remotePath: string,
     options: { content?: string; localPath?: string }
   ): Promise<{ success: boolean; path: string; size: number }> {
-    const profile = resolveTarget(hostOrTarget);
-    const conn = new SSHConnection({ profile });
-
-    try {
-      await conn.connect();
-      const sftp = new SFTPClient(conn.getRawClient());
-
-      let size = 0;
-      if (options.content !== undefined) {
-        await sftp.writeFile(remotePath, options.content);
-        size = Buffer.byteLength(options.content, 'utf8');
-      } else if (options.localPath) {
-        const resolved = path.resolve(options.localPath);
-        if (!fs.existsSync(resolved)) throw new Error(`Local file not found: ${resolved}`);
-        await sftp.uploadFile(resolved, remotePath);
-        size = fs.statSync(resolved).size;
-      } else {
-        throw new Error('Either content or localPath must be provided');
-      }
-
-      conn.disconnect();
-      return { success: true, path: remotePath, size };
-    } catch (err: any) {
-      conn.disconnect();
-      throw err;
+    const { content, localPath } = options;
+    if (content !== undefined) {
+      return withSftp(hostOrTarget, async sftp => {
+        await sftp.writeFile(remotePath, content);
+        return { success: true, path: remotePath, size: Buffer.byteLength(content, 'utf8') };
+      });
     }
+    if (!localPath) throw new Error('Either content or localPath must be provided');
+    const source = path.resolve(localPath);
+    if (!fs.existsSync(source)) throw new Error(`Local file not found: ${source}`);
+    return withSftp(hostOrTarget, async sftp => {
+      await sftp.uploadFile(source, remotePath);
+      return { success: true, path: remotePath, size: fs.statSync(source).size };
+    });
   }
 
   /**
    * Download remote file or read content
    */
-  public static async downloadFile(
+  public static downloadFile(
     hostOrTarget: string,
     remotePath: string,
     localPath?: string
   ): Promise<{ content?: string; localPath?: string; size: number }> {
-    const profile = resolveTarget(hostOrTarget);
-    const conn = new SSHConnection({ profile });
-
-    try {
-      await conn.connect();
-      const sftp = new SFTPClient(conn.getRawClient());
-      const stat = await sftp.stat(remotePath);
-
+    return withSftp(hostOrTarget, async sftp => {
+      const { size } = await sftp.stat(remotePath);
       if (localPath) {
         await sftp.downloadFile(remotePath, localPath);
-        conn.disconnect();
-        return { localPath, size: stat.size };
-      } else {
-        const content = await sftp.readFile(remotePath);
-        conn.disconnect();
-        return { content, size: stat.size };
+        return { localPath, size };
       }
-    } catch (err: any) {
-      conn.disconnect();
-      throw err;
-    }
+      return { content: await sftp.readFile(remotePath), size };
+    });
   }
 
   /**
    * Gather comprehensive system information from remote machine
    */
-  public static async getSystemInfo(hostOrTarget: string): Promise<{
+  public static getSystemInfo(hostOrTarget: string): Promise<{
     host: string;
     username: string;
     hostname: string;
@@ -233,17 +204,9 @@ export class SkillTools {
     memory: string[];
     disk: string[];
   }> {
-    const profile = resolveTarget(hostOrTarget);
-    const conn = new SSHConnection({ profile });
-
-    try {
-      await conn.connect();
-      const client = conn.getRawClient();
-
-      const run = async (cmd: string) => {
-        const r = await execCommand(client, cmd, { timeout: 10000 });
-        return r.stdout.trim();
-      };
+    return withConnection(hostOrTarget, async (connection, profile) => {
+      const client = connection.getRawClient();
+      const run = async (cmd: string) => (await execCommand(client, cmd, { timeout: 10000 })).stdout.trim();
 
       const [osInfo, uname, uptime, mem, disk, cpu, hostname] = await Promise.all([
         run('cat /etc/os-release 2>/dev/null || sw_vers 2>/dev/null || uname -s'),
@@ -254,8 +217,6 @@ export class SkillTools {
         run('lscpu 2>/dev/null | grep -E "Model name|CPU\\(s\\):" || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "N/A"'),
         run('hostname')
       ]);
-
-      conn.disconnect();
 
       return {
         host: profile.host,
@@ -268,10 +229,7 @@ export class SkillTools {
         memory: mem.split('\n').filter(Boolean),
         disk: disk.split('\n').filter(Boolean)
       };
-    } catch (err: any) {
-      conn.disconnect();
-      throw err;
-    }
+    });
   }
 
   /**

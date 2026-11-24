@@ -404,6 +404,29 @@ test('WebDAV provider aborts requests that exceed the configured timeout', async
   }
 });
 
+test('Gist push explains rejected writes with GitHub status and reason', async () => {
+  const originalFetch = globalThis.fetch;
+  const replies: Response[] = [];
+  globalThis.fetch = (async () => replies.shift() ?? new Response('unexpected request', { status: 500 })) as typeof fetch;
+
+  try {
+    const existing = new GistProvider({ token: 'test-token', gistId: 'abc123' }, 100);
+    replies.push(Response.json({ message: 'Validation Failed' }, { status: 422, statusText: 'Unprocessable Entity' }));
+    await assert.rejects(existing.push('snapshot'), {
+      message: 'Failed to update Gist abc123 (422 Unprocessable Entity: Validation Failed)'
+    });
+
+    const fresh = new GistProvider({ token: 'test-token' }, 100);
+    replies.push(Response.json([]), Response.json({ message: 'Resource not accessible' }, { status: 403, statusText: 'Forbidden' }));
+    await assert.rejects(fresh.push('snapshot'), /^Error: GitHub token lacks Gist write permission \(403 Forbidden: Resource not accessible\)/);
+
+    replies.push(Response.json([]), new Response('<html>outage</html>', { status: 502, statusText: 'Bad Gateway' }));
+    await assert.rejects(fresh.push('snapshot'), { message: 'Failed to create secret Gist (502 Bad Gateway)' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('Gist push does not create a new backup when Gist lookup fails', async () => {
   const originalFetch = globalThis.fetch;
   let createRequested = false;

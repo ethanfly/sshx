@@ -1,6 +1,7 @@
 import net from 'node:net';
 import EventEmitter from 'node:events';
 import { Client, ClientChannel, TcpConnectionDetails, AcceptConnection, RejectConnection } from 'ssh2';
+import { errorMessage, toError } from './errors.js';
 
 export type TunnelType = 'local' | 'remote' | 'dynamic';
 
@@ -98,11 +99,13 @@ export class Tunnel extends EventEmitter {
       this.startTime = new Date();
       this.lastError = undefined;
       this.emit('start', this.getStats());
-    } catch (err: any) {
+    } catch (err) {
+      const error = toError(err);
       this.status = 'error';
-      this.lastError = err.message || String(err);
-      this.emit('error', err);
-      throw err;
+      this.lastError = errorMessage(error);
+      // The rejected promise already reports the failure; the event is for observers such as TunnelManager.
+      if (this.listenerCount('error') > 0) this.emit('error', error);
+      throw error;
     }
   }
 
