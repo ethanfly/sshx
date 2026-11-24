@@ -1,6 +1,6 @@
 import net from 'node:net';
 import EventEmitter from 'node:events';
-import { Client } from 'ssh2';
+import { Client, ClientChannel, TcpConnectionDetails, AcceptConnection, RejectConnection } from 'ssh2';
 
 export type TunnelType = 'local' | 'remote' | 'dynamic';
 
@@ -40,6 +40,7 @@ export class Tunnel extends EventEmitter {
   private startTime?: Date;
   private lastError?: string;
   private activeSockets: Set<net.Socket> = new Set();
+  private remoteConnectionHandler?: (details: TcpConnectionDetails, accept: AcceptConnection<ClientChannel>, reject: RejectConnection) => void;
 
   constructor(client: Client, config: TunnelConfig) {
     super();
@@ -126,9 +127,16 @@ export class Tunnel extends EventEmitter {
       this.server = undefined;
     }
 
-    if (this.config.type === 'remote' && this.config.remotePort) {
+    if (this.remoteConnectionHandler) {
+      this.client.removeListener('tcp connection', this.remoteConnectionHandler);
+      this.remoteConnectionHandler = undefined;
       await new Promise<void>((resolve) => {
-        this.client.unforwardIn(this.config.remoteHost || '127.0.0.1', this.config.remotePort!, () => resolve());
+        try {
+          this.client.unforwardIn(this.config.remoteHost || '127.0.0.1', this.config.remotePort!, () => resolve());
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== 'Not connected') throw error;
+          resolve();
+        }
       });
     }
 
@@ -158,6 +166,14 @@ export class Tunnel extends EventEmitter {
             socket.destroy();
             return;
           }
+          if (socket.destroyed) {
+            stream.close();
+            return;
+          }
+
+          stream.on('error', () => socket.destroy());
+          stream.on('close', () => { if (!stream.readableEnded) socket.destroy(); });
+          socket.on('close', () => stream.destroy());
 
           socket.on('data', (data) => {
             this.bytesOut += data.length;
@@ -196,13 +212,11 @@ export class Tunnel extends EventEmitter {
       });
     });
 
-    const onTcpConnection = (details: any, accept: () => any, reject: () => any) => {
+    const onTcpConnection = (details: TcpConnectionDetails, accept: AcceptConnection<ClientChannel>) => {
       if (details.destPort !== remoteBindPort) return;
 
       const stream = accept();
       const localSocket = net.connect(localTargetPort, localTargetHost, () => {
-        this.handleSocketConnection(localSocket);
-
         localSocket.on('data', (data) => {
           this.bytesOut += data.length;
         });
@@ -213,6 +227,10 @@ export class Tunnel extends EventEmitter {
         stream.pipe(localSocket).pipe(stream);
       });
 
+      this.handleSocketConnection(localSocket);
+      stream.on('error', () => localSocket.destroy());
+      stream.on('close', () => { if (!stream.readableEnded) localSocket.destroy(); });
+      localSocket.on('close', () => stream.destroy());
       localSocket.on('error', () => {
         try {
           stream.close();
@@ -222,6 +240,7 @@ export class Tunnel extends EventEmitter {
       });
     };
 
+    this.remoteConnectionHandler = onTcpConnection;
     this.client.on('tcp connection', onTcpConnection);
   }
 
@@ -250,84 +269,100 @@ export class Tunnel extends EventEmitter {
    * SOCKS5 protocol handler
    */
   private handleSocks5Handshake(socket: net.Socket): void {
-    let state: 'AUTH' | 'REQUEST' | 'STREAM' = 'AUTH';
+    let state: 'AUTH' | 'REQUEST' | 'CONNECTING' = 'AUTH';
+    let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+
+    const reject = (code: number) => {
+      socket.end(Buffer.from([0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+    };
 
     const onData = (chunk: Buffer) => {
       try {
-        if (state === 'AUTH') {
-          // Chunk: [VER: 1B, NMETHODS: 1B, METHODS: NB]
-          if (chunk.length < 2 || chunk[0] !== 0x05) {
-            socket.destroy();
-            return;
+        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+        while (state !== 'CONNECTING') {
+          if (state === 'AUTH') {
+            if (pending.length < 2) return;
+            if (pending[0] !== 0x05 || pending[1] === 0) {
+              socket.destroy();
+              return;
+            }
+            const length = 2 + pending[1];
+            if (pending.length < length) return;
+            const supportsNoAuth = pending.subarray(2, length).includes(0x00);
+            pending = pending.subarray(length);
+            if (!supportsNoAuth) {
+              socket.end(Buffer.from([0x05, 0xff]));
+              return;
+            }
+            socket.write(Buffer.from([0x05, 0x00]));
+            state = 'REQUEST';
+            continue;
           }
-          // Reply: [VER: 0x05, METHOD: 0x00 (NO AUTH)]
-          socket.write(Buffer.from([0x05, 0x00]));
-          state = 'REQUEST';
-        } else if (state === 'REQUEST') {
-          // Chunk: [VER: 0x05, CMD: 1B, RSV: 0x00, ATYP: 1B, DST.ADDR, DST.PORT: 2B]
-          if (chunk.length < 6 || chunk[0] !== 0x05) {
+
+          if (pending.length < 4) return;
+          if (pending[0] !== 0x05 || pending[2] !== 0x00) {
             socket.destroy();
             return;
           }
 
-          const cmd = chunk[1]; // 0x01 = CONNECT
-          if (cmd !== 0x01) {
-            // Command not supported
-            socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-            socket.destroy();
+          if (pending[1] !== 0x01) {
+            reject(0x07);
             return;
           }
 
-          const atyp = chunk[3];
+          const atyp = pending[3];
           let targetHost = '';
           let offset = 4;
 
           if (atyp === 0x01) {
-            // IPv4
-            if (chunk.length < offset + 4 + 2) return socket.destroy();
-            targetHost = `${chunk[offset]}.${chunk[offset + 1]}.${chunk[offset + 2]}.${chunk[offset + 3]}`;
+            if (pending.length < offset + 4 + 2) return;
+            targetHost = `${pending[offset]}.${pending[offset + 1]}.${pending[offset + 2]}.${pending[offset + 3]}`;
             offset += 4;
           } else if (atyp === 0x03) {
-            // Domain name
-            const domainLen = chunk[offset++];
-            if (chunk.length < offset + domainLen + 2) return socket.destroy();
-            targetHost = chunk.subarray(offset, offset + domainLen).toString('utf8');
+            if (pending.length < offset + 1) return;
+            const domainLen = pending[offset++];
+            if (domainLen === 0) return socket.destroy();
+            if (pending.length < offset + domainLen + 2) return;
+            targetHost = pending.subarray(offset, offset + domainLen).toString('utf8');
             offset += domainLen;
           } else if (atyp === 0x04) {
-            // IPv6
-            if (chunk.length < offset + 16 + 2) return socket.destroy();
+            if (pending.length < offset + 16 + 2) return;
             const parts: string[] = [];
             for (let i = 0; i < 16; i += 2) {
-              parts.push(chunk.readUInt16BE(offset + i).toString(16));
+              parts.push(pending.readUInt16BE(offset + i).toString(16));
             }
             targetHost = parts.join(':');
             offset += 16;
           } else {
-            // Address type not supported
-            socket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-            socket.destroy();
+            reject(0x08);
             return;
           }
 
-          const targetPort = chunk.readUInt16BE(offset);
+          const targetPort = pending.readUInt16BE(offset);
+          const initialData = pending.subarray(offset + 2);
+          pending = Buffer.alloc(0);
           socket.removeListener('data', onData);
-          state = 'STREAM';
+          socket.pause();
+          state = 'CONNECTING';
 
-          // Forward connection through SSH client
           this.client.forwardOut(
             socket.remoteAddress || '127.0.0.1',
             socket.remotePort || 0,
             targetHost,
             targetPort,
             (err, stream) => {
+              if (socket.destroyed) {
+                stream?.close();
+                return;
+              }
               if (err) {
-                // Connection refused
-                socket.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-                socket.destroy();
+                reject(0x05);
                 return;
               }
 
-              // Send success response: [VER: 5, REP: 0, RSV: 0, ATYP: 1, BND.ADDR: 0.0.0.0, BND.PORT: 0]
+              stream.on('error', () => socket.destroy());
+              stream.on('close', () => { if (!stream.readableEnded) socket.destroy(); });
+              socket.on('close', () => stream.destroy());
               socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
 
               socket.on('data', (d) => {
@@ -337,9 +372,15 @@ export class Tunnel extends EventEmitter {
                 this.bytesIn += d.length;
               });
 
+              if (initialData.length) {
+                this.bytesOut += initialData.length;
+                stream.write(initialData);
+              }
               socket.pipe(stream).pipe(socket);
+              socket.resume();
             }
           );
+          return;
         }
       } catch {
         socket.destroy();
@@ -356,15 +397,13 @@ export class Tunnel extends EventEmitter {
     this.emit('connection', { active: this.activeConnections, total: this.totalConnections });
 
     socket.once('close', () => {
-      this.activeSockets.delete(socket);
-      this.activeConnections = Math.max(0, this.activeConnections - 1);
-      this.emit('connection', { active: this.activeConnections, total: this.totalConnections });
+      if (this.activeSockets.delete(socket)) {
+        this.activeConnections--;
+        this.emit('connection', { active: this.activeConnections, total: this.totalConnections });
+      }
     });
 
-    socket.once('error', () => {
-      this.activeSockets.delete(socket);
-      this.activeConnections = Math.max(0, this.activeConnections - 1);
-    });
+    socket.once('error', () => socket.destroy());
   }
 }
 
@@ -439,27 +478,33 @@ export class TunnelManager extends EventEmitter {
  */
 export function parsePortForwardString(spec: string, type: 'local' | 'remote' | 'dynamic'): TunnelConfig {
   const id = `tunnel_${type}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const invalid = () => new Error(`Invalid port forwarding specification: "${spec}". Expected "[bind_address:]port:host:hostport" (-L/-R) or "[bind_address:]port" (-D)`);
+  const port = (value: string): number => {
+    if (!/^\d+$/.test(value)) throw invalid();
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) throw invalid();
+    return parsed;
+  };
 
   if (type === 'dynamic') {
-    // Format: [bind_address:]port
     const parts = spec.split(':');
     if (parts.length === 1) {
-      return { id, type, localHost: '127.0.0.1', localPort: parseInt(parts[0], 10) };
-    } else {
-      return { id, type, localHost: parts[0], localPort: parseInt(parts[1], 10) };
+      return { id, type, localHost: '127.0.0.1', localPort: port(parts[0]) };
     }
+    if (parts.length !== 2 || !parts[0]) throw invalid();
+    return { id, type, localHost: parts[0], localPort: port(parts[1]) };
   }
 
-  // Format: [bind_address:]port:host:hostport
   const parts = spec.split(':');
   if (parts.length !== 3 && parts.length !== 4) {
-    throw new Error(`Invalid port forwarding specification: "${spec}". Expected "[bind_address:]port:host:hostport"`);
+    throw invalid();
   }
   const [bindHost, bindPortText, targetHost, targetPortText] = parts.length === 4
     ? parts
     : ['127.0.0.1', ...parts];
-  const bindPort = parseInt(bindPortText, 10);
-  const targetPort = parseInt(targetPortText, 10);
+  if (!bindHost || !targetHost) throw invalid();
+  const bindPort = port(bindPortText);
+  const targetPort = port(targetPortText);
   return type === 'local'
     ? { id, type, localHost: bindHost, localPort: bindPort, remoteHost: targetHost, remotePort: targetPort }
     : { id, type, localHost: targetHost, localPort: targetPort, remoteHost: bindHost, remotePort: bindPort };

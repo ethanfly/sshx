@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
 import { defaultConfigManager, HostProfile, resolvePortablePath } from '../core/config.js';
@@ -45,12 +46,47 @@ export class TargetNotFoundError extends Error {
   }
 }
 
+function parsePort(value: string | number): number {
+  if (!/^\d+$/.test(String(value))) throw new Error(`Invalid SSH port: ${value}`);
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`Invalid SSH port: ${value}`);
+  return port;
+}
+
+function parseAddress(target: string): { host: string; username?: string; port?: number } {
+  const at = target.indexOf('@');
+  const username = at === -1 ? undefined : target.slice(0, at);
+  let address = at === -1 ? target : target.slice(at + 1);
+  if (!address || (at !== -1 && (!username || address.includes('@')))) {
+    throw new Error(`Invalid SSH target: ${target}`);
+  }
+
+  let port: number | undefined;
+  if (address.startsWith('[')) {
+    const bracketed = /^\[([^\]]+)\](?::(.+))?$/.exec(address);
+    if (!bracketed || isIP(bracketed[1]) !== 6) throw new Error(`Invalid SSH target: ${target}`);
+    address = bracketed[1];
+    if (bracketed[2] !== undefined) port = parsePort(bracketed[2]);
+  } else if (address.includes(':') && isIP(address) !== 6) {
+    const colon = address.lastIndexOf(':');
+    if (colon !== address.indexOf(':') || !address.slice(0, colon)) {
+      throw new Error(`Invalid SSH target: ${target}`);
+    }
+    port = parsePort(address.slice(colon + 1));
+    address = address.slice(0, colon);
+  }
+
+  if (!address || /[\s\[\]@]/.test(address)) throw new Error(`Invalid SSH target: ${target}`);
+  return { host: address, username, port };
+}
+
 /**
  * Resolves destination argument into a HostProfile
  */
 export function resolveTarget(target: string, options: ConnectCliOptions = {}): HostProfile {
   const envPassword = process.env.SSH_PASSWORD;
-  const password = options.password || envPassword;
+  const requestedPort = options.port === undefined ? undefined : parsePort(options.port);
+  const password = options.password ?? envPassword;
 
   // 1. Direct match: check if target matches existing profile name, id, or host
   let existing = defaultConfigManager.getHost(target);
@@ -65,16 +101,22 @@ export function resolveTarget(target: string, options: ConnectCliOptions = {}): 
   }
 
   if (existing) {
-    const keyPath = options.identity || existing.privateKeyPath;
-    const resolvedPassword = options.password || existing.password || envPassword;
+    const port = requestedPort ?? existing.port;
+    const username = options.user ?? userPrefix ?? existing.username;
+    const changedEndpoint = port !== existing.port || username !== existing.username;
+    const keyPath = options.identity ?? (changedEndpoint || options.password !== undefined ? undefined : existing.privateKeyPath);
+    const resolvedPassword = options.password ?? (changedEndpoint || options.identity ? undefined : existing.password) ?? envPassword;
     return {
       ...existing,
-      port: options.port ? Number(options.port) : existing.port,
-      username: options.user || userPrefix || existing.username,
+      port,
+      username,
       privateKeyPath: keyPath ? resolvePortablePath(keyPath, defaultConfigManager.getConfigDir()) : undefined,
+      privateKey: changedEndpoint || options.identity || options.password !== undefined ? undefined : existing.privateKey,
+      passphrase: changedEndpoint || options.identity || options.password !== undefined ? undefined : existing.passphrase,
       password: resolvedPassword,
-      authType: options.password ? 'password' : (options.identity ? 'privateKey' : existing.authType),
-      proxyJump: options.jump || existing.proxyJump
+      authType: options.password !== undefined ? 'password' : (options.identity ? 'privateKey' : (changedEndpoint ? 'password' : existing.authType)),
+      proxyJump: options.jump ?? (changedEndpoint ? undefined : existing.proxyJump),
+      proxyCommand: changedEndpoint ? undefined : existing.proxyCommand
     };
   }
 
@@ -84,7 +126,7 @@ export function resolveTarget(target: string, options: ConnectCliOptions = {}): 
     target.includes(':') ||
     target.includes('.') ||
     target.toLowerCase() === 'localhost' ||
-    Boolean(options.user || options.port || options.identity || options.password);
+    Boolean(options.user || requestedPort || options.identity || options.password);
 
   const allHosts = defaultConfigManager.getHosts();
 
@@ -93,22 +135,11 @@ export function resolveTarget(target: string, options: ConnectCliOptions = {}): 
     throw new TargetNotFoundError(target, suggestions, allHosts);
   }
 
-  // Parse [user@]hostname[:port]
-  let username = options.user || os.userInfo().username || 'root';
-  let host = target;
-  let port = options.port ? Number(options.port) : 22;
-
-  if (host.includes('@')) {
-    const parts = host.split('@');
-    username = parts[0];
-    host = parts[1];
-  }
-
-  if (host.includes(':')) {
-    const parts = host.split(':');
-    host = parts[0];
-    port = Number(parts[1]) || 22;
-  }
+  // Parse [user@]hostname[:port], [user@][IPv6][:port], or a bare IPv6 address.
+  const address = parseAddress(target);
+  const username = options.user ?? address.username ?? os.userInfo().username ?? 'root';
+  const host = address.host;
+  const port = requestedPort ?? address.port ?? 22;
 
   const defaultKey = path.join(os.homedir(), '.ssh', 'id_ed25519');
   const defaultRsa = path.join(os.homedir(), '.ssh', 'id_rsa');
