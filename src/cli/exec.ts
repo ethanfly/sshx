@@ -7,6 +7,7 @@ import { colors } from './utils.js';
 export interface ExecCliOptions extends ConnectCliOptions {
   json?: boolean;
   timeout?: string | number;
+  maxOutputBytes?: string | number;
   env?: string[];
 }
 
@@ -25,20 +26,30 @@ export async function runExec(
   const connection = new SSHConnection({ profile });
 
   try {
-    await connection.connect();
-
-    const envMap: Record<string, string> = {};
+    const envMap: Record<string, string> = Object.create(null);
     if (options.env) {
       for (const item of options.env) {
-        const [k, v] = item.split('=');
-        if (k && v !== undefined) envMap[k] = v;
+        const separator = item.indexOf('=');
+        if (separator <= 0) throw new Error(`Expected KEY=VAL for --env: ${item}`);
+        envMap[item.slice(0, separator)] = item.slice(separator + 1);
       }
     }
 
-    const timeoutMs = options.timeout ? Number(options.timeout) * 1000 : undefined;
+    const timeoutSeconds = options.timeout === undefined ? undefined : Number(options.timeout);
+    if (timeoutSeconds !== undefined && (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds * 1000 > 2_147_483_647)) {
+      throw new Error('--timeout must be between 0 and 2147483.647 seconds');
+    }
+    const timeoutMs = timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000;
+    const maxOutputBytes = options.maxOutputBytes === undefined ? undefined : Number(options.maxOutputBytes);
+    if (maxOutputBytes !== undefined && (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0)) {
+      throw new Error('--max-output-bytes must be a positive safe integer');
+    }
+
+    await connection.connect();
 
     const result = await execCommand(connection.getRawClient(), command, {
       timeout: timeoutMs,
+      maxOutputBytes,
       env: Object.keys(envMap).length > 0 ? envMap : undefined
     });
 

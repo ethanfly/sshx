@@ -95,6 +95,32 @@ test('CLI: exec command against mock SSH server with --json', async () => {
   assert.equal(data.stdout.trim(), 'hello');
 });
 
+test('CLI: exec rejects invalid limits and preserves equals signs in environment values', async () => {
+  const base = ['exec', 'testuser@127.0.0.1', '-p', String(serverPort), '--password', 'testpass', 'echo hello'];
+  for (const args of [
+    ['--timeout', '0'],
+    ['--timeout', 'not-a-number'],
+    ['--timeout', '2147484'],
+    ['--max-output-bytes', '-1'],
+    ['--env', 'MISSING_EQUALS']
+  ]) {
+    const result = await runCli([...base, ...args]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--timeout|--max-output-bytes|KEY=VAL/);
+  }
+
+  const result = await runCli([
+    'exec', 'testuser@127.0.0.1', '-p', String(serverPort), '--password', 'testpass',
+    'printenv TEST_EXEC_VALUE', '--env', 'TEST_EXEC_VALUE=one=two', '--max-output-bytes', '100'
+  ]);
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, 'one=two');
+
+  const limited = await runCli([...base, '--max-output-bytes', '1']);
+  assert.equal(limited.code, 1);
+  assert.match(limited.stderr, /output exceeded 1 bytes/);
+});
+
 test('CLI: host list --json returns valid JSON array', async () => {
   const res = await runCli(['host', 'list', '--json']);
   assert.equal(res.code, 0);

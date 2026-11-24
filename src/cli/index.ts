@@ -99,6 +99,7 @@ export function createCli(): Command {
     .option('--password <password>', 'Password for authentication')
     .option('--json', 'Output result in JSON format')
     .option('--timeout <seconds>', 'Command timeout in seconds')
+    .option('--max-output-bytes <bytes>', 'Maximum combined stdout/stderr bytes (default: 33554432)')
     .option('-e, --env <vars...>', 'Environment variables in KEY=VAL format')
     .action(async (target, cmd, options, command) => {
       await runExec(target, cmd, command.optsWithGlobals());

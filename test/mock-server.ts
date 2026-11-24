@@ -63,13 +63,22 @@ export class MockSSHServer {
       client.on('ready', () => {
         client.on('session', (accept) => {
           const session = accept();
+          const environment = new Map<string, string>();
+          session.on('env', (acceptEnv, _rejectEnv, info) => {
+            environment.set(info.key, info.val);
+            acceptEnv?.();
+          });
 
           // Handle exec
           session.on('exec', (acceptExec, rejectExec, info) => {
             const stream = acceptExec();
             const cmd = info.command.trim();
 
-            if (cmd === 'echo hello') {
+            if (cmd === 'printenv TEST_EXEC_VALUE') {
+              stream.write(environment.get('TEST_EXEC_VALUE') ?? '');
+              stream.exit(0);
+              stream.end();
+            } else if (cmd === 'echo hello') {
               stream.write('hello\n');
               stream.exit(0);
               stream.end();

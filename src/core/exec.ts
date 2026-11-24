@@ -1,8 +1,9 @@
 import { constants as osConstants } from 'node:os';
-import { Client, ClientChannel } from 'ssh2';
+import { Client, ClientChannel, ExecOptions as SshExecOptions } from 'ssh2';
 
 export interface ExecOptions {
   timeout?: number; // ms
+  maxOutputBytes?: number;
   env?: Record<string, string>;
   pty?: boolean | { rows?: number; cols?: number; term?: string };
   stdin?: string | Buffer | NodeJS.ReadableStream;
@@ -27,12 +28,21 @@ export async function execCommand(
   options: ExecOptions = {}
 ): Promise<ExecResult> {
   const startTime = Date.now();
+  const maxOutputBytes = options.maxOutputBytes ?? 32 * 1024 * 1024;
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
+    throw new RangeError('maxOutputBytes must be a positive safe integer');
+  }
+  if (options.timeout !== undefined && (!Number.isFinite(options.timeout) || options.timeout < 0 || options.timeout > 2_147_483_647)) {
+    throw new RangeError('timeout must be between 0 and 2147483647 milliseconds');
+  }
 
   return new Promise<ExecResult>((resolve, reject) => {
     let timeoutTimer: NodeJS.Timeout | undefined;
     let finished = false;
+    let stream: ClientChannel | undefined;
+    let inputStream: NodeJS.ReadableStream | undefined;
 
-    const execOpts: any = {};
+    const execOpts: SshExecOptions = {};
     if (options.env) {
       execOpts.env = options.env;
     }
@@ -40,84 +50,120 @@ export async function execCommand(
       execOpts.pty = typeof options.pty === 'object' ? options.pty : { term: 'xterm-256color' };
     }
 
-    client.exec(command, execOpts, (err: Error | undefined, stream: ClientChannel) => {
-      if (err) return reject(err);
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let exitCode: number | undefined;
+    let exitSignal: string | undefined;
+    let outputBytes = 0;
 
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
-      let exitCode: number | undefined;
-      let exitSignal: string | undefined;
-
-      if (options.timeout && options.timeout > 0) {
-        timeoutTimer = setTimeout(() => {
-          if (!finished) {
-            finished = true;
-            try {
-              stream.signal('KILL');
-              stream.close();
-            } catch {
-              // ignore
-            }
-            reject(new Error(`Command timed out after ${options.timeout}ms: "${command}"`));
-          }
-        }, options.timeout);
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      client.removeListener('error', onConnectionError);
+      client.removeListener('close', onConnectionClose);
+      if (inputStream) {
+        if (stream) inputStream.unpipe(stream);
+        inputStream.removeListener('error', onInputError);
       }
+    };
 
-      stream.on('data', (chunk: Buffer) => {
-        stdoutChunks.push(chunk);
-        if (options.onStdout) options.onStdout(chunk);
-      });
+    const closeChannel = (channel: ClientChannel) => {
+      try { channel.signal('KILL'); } catch {}
+      try { channel.close(); } catch {}
+    };
 
-      stream.stderr.on('data', (chunk: Buffer) => {
-        stderrChunks.push(chunk);
-        if (options.onStderr) options.onStderr(chunk);
-      });
+    const fail = (error: Error) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      if (stream) closeChannel(stream);
+      reject(error);
+    };
 
-      // Handle stdin if provided
-      if (options.stdin) {
-        if (typeof options.stdin === 'string' || Buffer.isBuffer(options.stdin)) {
-          stream.write(options.stdin);
-          stream.end();
-        } else {
-          options.stdin.pipe(stream);
-        }
+    const onConnectionError = (error: Error) => fail(error);
+    const onConnectionClose = () => fail(new Error('SSH connection closed before command completed'));
+    const onInputError = (error: Error) => fail(error);
+
+    client.on('error', onConnectionError);
+    client.on('close', onConnectionClose);
+
+    if (options.timeout && options.timeout > 0) {
+      timeoutTimer = setTimeout(() => {
+        fail(new Error(`Command timed out after ${options.timeout}ms`));
+      }, options.timeout);
+    }
+
+    const collectOutput = (chunk: Buffer, chunks: Buffer[], callback?: (chunk: Buffer) => void) => {
+      if (finished) return;
+      outputBytes += chunk.length;
+      if (outputBytes > maxOutputBytes) {
+        fail(new Error(`SSH command output exceeded ${maxOutputBytes} bytes`));
+        return;
       }
+      chunks.push(chunk);
+      try { callback?.(chunk); } catch (callbackError) {
+        fail(callbackError instanceof Error ? callbackError : new Error(String(callbackError)));
+      }
+    };
 
-      stream.on('exit', (code: number | null, signal?: string) => {
-        exitCode = code ?? undefined;
-        exitSignal = signal;
-      });
-
-      stream.on('close', () => {
-        if (finished) return;
-        finished = true;
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-
-        if (exitSignal) {
-          const signalNumber = osConstants.signals[exitSignal as NodeJS.Signals];
-          exitCode = typeof signalNumber === 'number' && signalNumber > 0 ? 128 + signalNumber : 1;
+    try {
+      client.exec(command, execOpts, (error: Error | undefined, channel: ClientChannel) => {
+        if (finished) {
+          if (channel) closeChannel(channel);
+          return;
         }
-        if (exitCode === undefined) {
-          reject(new Error('SSH channel closed without a command exit status'));
+        if (error) {
+          fail(error);
           return;
         }
 
-        const durationMs = Date.now() - startTime;
-        resolve({
-          stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-          stderr: Buffer.concat(stderrChunks).toString('utf8'),
-          exitCode,
-          signal: exitSignal,
-          durationMs
+        stream = channel;
+        channel.on('error', fail);
+        channel.stderr.on('error', fail);
+        channel.on('exit', (code: number | null, signal?: string) => {
+          exitCode = code ?? undefined;
+          exitSignal = signal;
         });
-      });
+        channel.on('close', () => {
+          if (finished) return;
+          if (exitSignal) {
+            const signalNumber = osConstants.signals[exitSignal as NodeJS.Signals];
+            exitCode = typeof signalNumber === 'number' && signalNumber > 0 ? 128 + signalNumber : 1;
+          }
+          if (exitCode === undefined) {
+            fail(new Error('SSH channel closed without a command exit status'));
+            return;
+          }
 
-      stream.on('error', (streamErr: Error) => {
-        if (finished) return;
-        finished = true;
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-        reject(streamErr);
+          finished = true;
+          cleanup();
+          resolve({
+            stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+            stderr: Buffer.concat(stderrChunks).toString('utf8'),
+            exitCode,
+            signal: exitSignal,
+            durationMs: Date.now() - startTime
+          });
+        });
+
+        channel.on('data', (chunk: Buffer) => collectOutput(chunk, stdoutChunks, options.onStdout));
+        channel.stderr.on('data', (chunk: Buffer) => collectOutput(chunk, stderrChunks, options.onStderr));
+
+        if (options.stdin !== undefined) {
+          try {
+            if (typeof options.stdin === 'string' || Buffer.isBuffer(options.stdin)) {
+              channel.end(options.stdin);
+            } else {
+              inputStream = options.stdin;
+              inputStream.on('error', onInputError);
+              inputStream.pipe(channel);
+            }
+          } catch (inputError) {
+            fail(inputError instanceof Error ? inputError : new Error(String(inputError)));
+          }
+        }
       });
-    });
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }

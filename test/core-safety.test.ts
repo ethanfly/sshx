@@ -13,11 +13,11 @@ import { execCommand, SFTPClient } from '../dist/index.js';
 function makeExecClient() {
   const channel = new EventEmitter();
   const stderr = new EventEmitter();
-  const client = {
+  const client = Object.assign(new EventEmitter(), {
     exec(_command: string, _options: unknown, callback: (err: undefined, stream: ClientChannel) => void) {
       callback(undefined, Object.assign(channel, { stderr }) as unknown as ClientChannel);
     }
-  } as unknown as Client;
+  }) as unknown as Client;
   return { client, channel, stderr };
 }
 
@@ -373,6 +373,111 @@ test('execCommand rejects a channel close without an exit status', async () => {
   const pending = execCommand(client, 'test command');
   channel.emit('close');
   await assert.rejects(pending, /closed without a command exit status/);
+});
+
+test('execCommand times out while waiting for the channel and closes a late channel', async () => {
+  let callback: ((error: undefined, stream: ClientChannel) => void) | undefined;
+  const client = Object.assign(new EventEmitter(), {
+    exec(_command: string, _options: unknown, onChannel: typeof callback) {
+      callback = onChannel;
+    }
+  }) as unknown as Client;
+
+  await assert.rejects(execCommand(client, 'stalled', { timeout: 20 }), /timed out after 20ms/);
+  const channel = Object.assign(new EventEmitter(), { closeCalls: 0, close() { this.closeCalls++; } });
+  callback!(undefined, channel as unknown as ClientChannel);
+  assert.equal(channel.closeCalls, 1);
+});
+
+test('execCommand closes an already-open channel when its timeout expires', async () => {
+  const channel = Object.assign(new EventEmitter(), {
+    stderr: new EventEmitter(),
+    closed: false,
+    signal() {},
+    close() { this.closed = true; }
+  });
+  const client = Object.assign(new EventEmitter(), {
+    exec(_command: string, _options: unknown, callback: (error: undefined, stream: ClientChannel) => void) {
+      callback(undefined, channel as unknown as ClientChannel);
+    }
+  }) as unknown as Client;
+
+  await assert.rejects(execCommand(client, 'stalled', { timeout: 20 }), /timed out after 20ms/);
+  assert.equal(channel.closed, true);
+  assert.equal(client.listenerCount('error'), 0);
+  assert.equal(client.listenerCount('close'), 0);
+});
+
+test('execCommand rejects output callback failures without leaking them from event handlers', async () => {
+  const { client, channel } = makeExecClient();
+  const pending = execCommand(client, 'test command', {
+    onStdout() { throw new Error('output handler failed'); }
+  });
+  assert.doesNotThrow(() => channel.emit('data', Buffer.from('output')));
+  await assert.rejects(pending, /output handler failed/);
+});
+
+test('execCommand rejects stderr stream failures without throwing from its event handler', async () => {
+  const { client, stderr } = makeExecClient();
+  const pending = execCommand(client, 'test command');
+  assert.doesNotThrow(() => stderr.emit('error', new Error('stderr stream failed')));
+  await assert.rejects(pending, /stderr stream failed/);
+});
+
+test('execCommand rejects when the SSH connection closes before opening a channel', async () => {
+  const client = Object.assign(new EventEmitter(), {
+    exec(_command: string, _options: unknown, _callback: unknown) {}
+  }) as unknown as Client;
+  const pending = execCommand(client, 'stalled');
+  client.emit('close');
+  await assert.rejects(pending, /connection closed before command completed/);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(client.listenerCount('error'), 0);
+});
+
+test('execCommand rejects piped stdin errors and unpipes its input', async () => {
+  const input = new Readable({ read() {} });
+  const channel = Object.assign(new Writable({ write(_chunk, _encoding, callback) { callback(); } }), {
+    stderr: new EventEmitter(),
+    signal() {},
+    close() {}
+  });
+  const client = Object.assign(new EventEmitter(), {
+    exec(_command: string, _options: unknown, callback: (error: undefined, stream: ClientChannel) => void) {
+      callback(undefined, channel as unknown as ClientChannel);
+    }
+  }) as unknown as Client;
+
+  const pending = execCommand(client, 'cat', { stdin: input });
+  input.emit('error', new Error('input failed'));
+  await assert.rejects(pending, /input failed/);
+  assert.equal(input.isPaused(), true);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(client.listenerCount('error'), 0);
+});
+
+test('execCommand closes stdin with an explicit empty string', async () => {
+  const { client, channel } = makeExecClient();
+  const writes: string[] = [];
+  Object.assign(channel, { end(value: string) { writes.push(value); } });
+  const pending = execCommand(client, 'cat', { stdin: '' });
+  assert.deepEqual(writes, ['']);
+  channel.emit('exit', 0);
+  channel.emit('close');
+  assert.equal((await pending).exitCode, 0);
+});
+
+test('execCommand caps combined stdout and stderr before buffering excessive output', async () => {
+  const { client, channel, stderr } = makeExecClient();
+  const pending = execCommand(client, 'noisy command', { maxOutputBytes: 5 });
+  channel.emit('data', Buffer.from('123'));
+  stderr.emit('data', Buffer.from('456'));
+  await assert.rejects(pending, /output exceeded 5 bytes/);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(client.listenerCount('error'), 0);
+  await assert.rejects(execCommand(client, 'bad limit', { maxOutputBytes: 0 }), /positive safe integer/);
+  await assert.rejects(execCommand(client, 'bad timeout', { timeout: Infinity }), /timeout must be between/);
+  await assert.rejects(execCommand(client, 'bad timeout', { timeout: 2_147_483_648 }), /timeout must be between/);
 });
 
 test('SFTP rm unlinks a symlink without listing or statting its target', async () => {

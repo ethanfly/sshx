@@ -26,11 +26,11 @@ function flushPoll() {
 test('MetricsCollector: rejected probes are non-fatal and stale samples are discarded', async (context) => {
   context.mock.timers.enable({ apis: ['setInterval'] });
   const requests: ((error?: Error, channel?: ReturnType<typeof mockChannel>) => void)[] = [];
-  const collector = new MetricsCollector({
+  const collector = new MetricsCollector(Object.assign(new EventEmitter(), {
     exec(_command: string, _options: unknown, callback: typeof requests[number]) {
       requests.push(callback);
     }
-  } as any, 25);
+  }) as any, 25);
   const updated = context.mock.fn();
   collector.on('update', updated);
 
@@ -74,12 +74,12 @@ test('SplitSession: sidebar polling follows visibility and stops at session clos
   context.mock.getter(process, 'stdout', () => output as unknown as typeof process.stdout);
   const channel = mockChannel();
   const exec = context.mock.fn((_command, _options, callback) => callback(new Error('metrics unavailable')));
-  const session = new SplitSession({
+  const session = new SplitSession(Object.assign(new EventEmitter(), {
     exec,
     shell(_options: unknown, callback: (error: undefined, channel: ReturnType<typeof mockChannel>) => void) {
       callback(undefined, channel);
     }
-  } as any, { enableSidebar: false });
+  }) as any, { enableSidebar: false });
 
   await session.start();
   try {
