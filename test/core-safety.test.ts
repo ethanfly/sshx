@@ -121,6 +121,9 @@ test('SFTP upload rejects write errors rather than reporting a successful transf
             callback(new Error('remote disk full'));
           }
         }) as ReturnType<SFTPWrapper['createWriteStream']>;
+      },
+      unlink(_remotePath, callback) {
+        callback();
       }
     });
     await assert.rejects(sftp.uploadFile(source, '/remote'), /remote disk full/);
@@ -139,9 +142,133 @@ test('SFTP upload rejects a close before the expected bytes are acknowledged', a
         const stream = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
         stream.once('finish', () => stream.emit('close'));
         return stream as ReturnType<SFTPWrapper['createWriteStream']>;
+      },
+      unlink(_remotePath, callback) {
+        callback();
       }
     });
     await assert.rejects(sftp.uploadFile(source, '/remote'), /closed before completion/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SFTP write keeps an existing file intact when the server lacks atomic replacement', async () => {
+  const files = new Map([['/existing.txt', 'original']]);
+  const sftp = makeSftpClient({
+    writeFile(remotePath, content, callback) {
+      files.set(remotePath, String(content));
+      callback?.();
+    },
+    lstat(_remotePath, callback) {
+      callback(undefined, { mode: fsConstants.S_IFREG | 0o640 } as Parameters<typeof callback>[1]);
+    },
+    chmod(_remotePath, _mode, callback) { callback(); },
+    rename() { assert.fail('regular rename cannot atomically replace an existing destination'); },
+    unlink(remotePath, callback) {
+      files.delete(remotePath);
+      callback();
+    }
+  });
+
+  await assert.rejects(sftp.writeFile('/existing.txt', 'replacement'), /cannot atomically overwrite/);
+  assert.deepEqual([...files], [['/existing.txt', 'original']]);
+});
+
+test('SFTP write atomically replaces an existing file when POSIX rename is supported', async () => {
+  const files = new Map([['/existing.txt', 'original']]);
+  let temporaryMode: number | undefined;
+  const sftp = makeSftpClient({
+    writeFile(remotePath, content, callback) {
+      files.set(remotePath, String(content));
+      callback?.();
+    },
+    lstat(_remotePath, callback) {
+      callback(undefined, { mode: fsConstants.S_IFREG | 0o640 } as Parameters<typeof callback>[1]);
+    },
+    chmod(_remotePath, mode, callback) {
+      temporaryMode = mode;
+      callback();
+    },
+    ext_openssh_rename(source, destination, callback) {
+      assert.equal(files.get(destination), 'original');
+      assert.equal(temporaryMode, 0o640);
+      files.set(destination, files.get(source)!);
+      files.delete(source);
+      callback();
+    },
+    unlink() { assert.fail('successful transfer must not delete its temporary file twice'); }
+  });
+
+  await sftp.writeFile('/existing.txt', 'replacement');
+  assert.deepEqual([...files], [['/existing.txt', 'replacement']]);
+});
+
+test('SFTP refuses to overwrite symbolic links and removes the temporary file', async () => {
+  const files = new Map([['/linked.txt', 'original']]);
+  const sftp = makeSftpClient({
+    writeFile(remotePath, content, callback) {
+      files.set(remotePath, String(content));
+      callback?.();
+    },
+    lstat(_remotePath, callback) {
+      callback(undefined, { mode: fsConstants.S_IFLNK | 0o777 } as Parameters<typeof callback>[1]);
+    },
+    ext_openssh_rename() { assert.fail('symbolic link must not be replaced'); },
+    unlink(remotePath, callback) {
+      files.delete(remotePath);
+      callback();
+    }
+  });
+
+  await assert.rejects(sftp.writeFile('/linked.txt', 'replacement'), /non-file SFTP destination/);
+  assert.deepEqual([...files], [['/linked.txt', 'original']]);
+});
+
+test('SFTP treats an unsupported POSIX rename as unsafe for overwriting', async () => {
+  const files = new Map([['/existing.txt', 'original']]);
+  const sftp = makeSftpClient({
+    writeFile(remotePath, content, callback) {
+      files.set(remotePath, String(content));
+      callback?.();
+    },
+    lstat(_remotePath, callback) {
+      callback(undefined, { mode: fsConstants.S_IFREG | 0o600 } as Parameters<typeof callback>[1]);
+    },
+    chmod(_remotePath, _mode, callback) { callback(); },
+    ext_openssh_rename(_source, _destination, callback) {
+      callback(Object.assign(new Error('Operation unsupported'), { code: 8 }));
+    },
+    rename() { assert.fail('unsafe rename must not run after an unsupported POSIX extension'); },
+    unlink(remotePath, callback) {
+      files.delete(remotePath);
+      callback();
+    }
+  });
+
+  await assert.rejects(sftp.writeFile('/existing.txt', 'replacement'), /cannot atomically overwrite/);
+  assert.deepEqual([...files], [['/existing.txt', 'original']]);
+});
+
+test('SFTP failed upload removes only its temporary remote file', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-atomic-upload-'));
+  const source = path.join(directory, 'source.txt');
+  fs.writeFileSync(source, 'new content');
+  const files = new Map([['/existing.txt', 'original']]);
+  try {
+    const sftp = makeSftpClient({
+      createWriteStream(remotePath) {
+        files.set(remotePath, 'partial');
+        return new Writable({ write(_chunk, _encoding, callback) { callback(new Error('remote disk full')); } }) as ReturnType<SFTPWrapper['createWriteStream']>;
+      },
+      lstat() { assert.fail('failed upload must not touch the destination'); },
+      unlink(remotePath, callback) {
+        files.delete(remotePath);
+        callback();
+      }
+    });
+    await assert.rejects(sftp.uploadFile(source, '/existing.txt'), /remote disk full/);
+    assert.deepEqual([...files], [['/existing.txt', 'original']]);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

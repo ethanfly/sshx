@@ -458,6 +458,22 @@ test('SFTPClient: lists, writes, reads, and deletes remote files', async () => {
   const content = await sftp.readFile('hello.txt');
   assert.equal(content, 'Hello SFTP World!');
 
+  const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-upload-test-'));
+  try {
+    const source = path.join(uploadDir, 'source.txt');
+    fs.writeFileSync(source, 'Uploaded over SFTP');
+    await sftp.uploadFile(source, 'uploaded.txt');
+    assert.equal(await sftp.readFile('uploaded.txt'), 'Uploaded over SFTP');
+    await sftp.rm('uploaded.txt');
+
+    fs.writeFileSync(source, '');
+    await sftp.uploadFile(source, 'empty.txt');
+    assert.equal(await sftp.readFile('empty.txt'), '');
+    await sftp.rm('empty.txt');
+  } finally {
+    fs.rmSync(uploadDir, { recursive: true, force: true });
+  }
+
   const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-download-test-'));
   try {
     const localPath = path.join(downloadDir, 'hello.txt');
@@ -474,6 +490,7 @@ test('SFTPClient: lists, writes, reads, and deletes remote files', async () => {
   const found = files.find(f => f.filename === 'hello.txt');
   assert.ok(found);
   assert.equal(found.filename, 'hello.txt');
+  assert.equal(files.some(file => file.filename.includes('.sshx-')), false);
 
   // Remove file
   await sftp.rm('hello.txt');

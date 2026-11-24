@@ -165,11 +165,12 @@ export class SFTPClient {
    */
   public async writeFile(remotePath: string, content: string | Buffer): Promise<void> {
     const sftp = await this.getWrapper();
-
-    return new Promise<void>((resolve, reject) => {
-      sftp.writeFile(remotePath, content, (error) => {
-        if (error) reject(error);
-        else resolve();
+    await this.writeTemporaryFile(remotePath, async (temporaryPath) => {
+      await new Promise<void>((resolve, reject) => {
+        sftp.writeFile(temporaryPath, content, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
       });
     });
   }
@@ -188,9 +189,9 @@ export class SFTPClient {
     let bytesTransferred = 0;
     const startTime = Date.now();
 
-    await new Promise<void>((resolve, reject) => {
+    await this.writeTemporaryFile(remotePath, (temporaryPath) => new Promise<void>((resolve, reject) => {
       const readStream = fs.createReadStream(localPath);
-      const writeStream = sftp.createWriteStream(remotePath);
+      const writeStream = sftp.createWriteStream(temporaryPath);
       let settled = false;
       const finish = (error?: Error) => {
         if (settled) return;
@@ -225,7 +226,70 @@ export class SFTPClient {
       writeStream.once('error', finish);
       readStream.once('error', finish);
       readStream.pipe(writeStream);
-    });
+    }));
+  }
+
+  private async writeTemporaryFile(remotePath: string, write: (temporaryPath: string) => Promise<void>): Promise<void> {
+    const sftp = await this.getWrapper();
+    const temporaryPath = path.posix.join(
+      path.posix.dirname(remotePath),
+      `.${path.posix.basename(remotePath)}.sshx-${randomUUID()}.tmp`
+    );
+
+    try {
+      await write(temporaryPath);
+      const existingMode = await new Promise<number | undefined>((resolve, reject) => {
+        sftp.lstat(remotePath, (error, stats) => {
+          if (isMissingFile(error)) resolve(undefined);
+          else if (error) reject(error);
+          else if ((stats.mode & fs.constants.S_IFMT) !== fs.constants.S_IFREG) {
+            reject(new Error(`Cannot replace a non-file SFTP destination: ${remotePath}`));
+          } else resolve(stats.mode & 0o777);
+        });
+      });
+
+      if (existingMode !== undefined) {
+        await new Promise<void>((resolve, reject) => {
+          sftp.chmod(temporaryPath, existingMode, (error) => error ? reject(error) : resolve());
+        });
+      }
+
+      let supportsPosixRename = typeof sftp.ext_openssh_rename === 'function';
+      if (supportsPosixRename) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            sftp.ext_openssh_rename(temporaryPath, remotePath, (error) => error ? reject(error) : resolve());
+          });
+          return;
+        } catch (error) {
+          if ((error as { code?: number }).code !== 8
+            && (!(error instanceof Error) || error.message !== 'Server does not support this extended request')) {
+            throw error;
+          }
+          supportsPosixRename = false;
+        }
+      }
+
+      if (!supportsPosixRename) {
+        if (existingMode !== undefined) {
+          throw new Error(`SFTP server cannot atomically overwrite ${remotePath} without POSIX rename support`);
+        }
+        await new Promise<void>((resolve, reject) => {
+          sftp.rename(temporaryPath, remotePath, (error) => error ? reject(error) : resolve());
+        });
+      }
+    } catch (error) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          sftp.unlink(temporaryPath, (cleanupError) => cleanupError ? reject(cleanupError) : resolve());
+        });
+      } catch (cleanupError) {
+        if (!isMissingFile(cleanupError)) {
+          throw new AggregateError([error, cleanupError], `SFTP transfer failed and temporary file could not be removed: ${temporaryPath}`);
+        }
+      }
+      throw error;
+    }
   }
 
   /**

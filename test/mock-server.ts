@@ -270,6 +270,20 @@ export class MockSSHServer {
       }
     });
 
+    sftpStream.on('RENAME', (reqid: number, oldPath: string, newPath: string) => {
+      try {
+        const destination = path.join(this.tempDir, newPath);
+        if (fs.existsSync(destination)) {
+          sftpStream.status(reqid, 4);
+          return;
+        }
+        fs.renameSync(path.join(this.tempDir, oldPath), destination);
+        sftpStream.status(reqid, 0);
+      } catch {
+        sftpStream.status(reqid, 4);
+      }
+    });
+
     sftpStream.on('RMDIR', (reqid: number, str: string) => {
       try {
         fs.rmdirSync(path.join(this.tempDir, str));
