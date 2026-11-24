@@ -79,10 +79,13 @@ export class WebDavProvider implements SyncProvider {
   }
 
   private async ensureDirectory(): Promise<void> {
-    await this.request(this.baseUrl, {
+    const res = await this.request(this.baseUrl, {
       method: 'MKCOL',
       headers: { Authorization: this.authHeader }
     });
+    if (!res.ok && res.status !== 405) {
+      throw new Error(`WebDAV directory setup failed with status ${res.status}: ${res.statusText}`);
+    }
   }
 
   public async pull(): Promise<string> {
@@ -224,6 +227,9 @@ export class GistProvider implements SyncProvider {
     const files = data && typeof data === 'object' ? (data as { files?: unknown }).files : undefined;
     const file = files && typeof files === 'object'
       ? (files as Record<string, unknown>)[GistProvider.GIST_FILENAME] : undefined;
+    if (file && typeof file === 'object' && (file as { truncated?: unknown }).truncated === true) {
+      throw new Error('Gist backup is truncated; cannot safely restore an incomplete snapshot.');
+    }
     const content = file && typeof file === 'object' ? (file as { content?: unknown }).content : undefined;
     if (typeof content !== 'string') {
       throw new Error(`Gist does not contain '${GistProvider.GIST_FILENAME}'.`);

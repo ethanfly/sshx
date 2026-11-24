@@ -455,6 +455,20 @@ test('Gist push finds an existing backup on later pages instead of creating a du
   }
 });
 
+test('Gist pull refuses a truncated encrypted backup', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () => Response.json({
+      files: { 'sshx-hosts.enc': { content: 'partial ciphertext', truncated: true } }
+    })) as typeof fetch;
+
+    const provider = new GistProvider({ token: 'test-token', gistId: 'existing-backup' });
+    await assert.rejects(provider.pull(), /backup is truncated/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('WebDAV push refuses to continue after a network failure when creating a directory', async () => {
   const originalFetch = globalThis.fetch;
   let putRequested = false;
@@ -468,6 +482,40 @@ test('WebDAV push refuses to continue after a network failure when creating a di
     const provider = new WebDavProvider({ url: 'https://dav.example.test/sshx', username: 'u', password: 'p' });
     await assert.rejects(provider.push('backup'), /WebDAV offline/);
     assert.equal(putRequested, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('WebDAV push rejects directory setup failures without attempting an upload', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  try {
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(init?.method ?? 'GET');
+      return new Response(null, { status: 403, statusText: 'Forbidden' });
+    }) as typeof fetch;
+
+    const provider = new WebDavProvider({ url: 'https://dav.example.test/sshx', username: 'u', password: 'p' });
+    await assert.rejects(provider.push('backup'), /directory setup failed with status 403/);
+    assert.deepEqual(requests, ['MKCOL']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('WebDAV push accepts an existing directory', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  try {
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(init?.method ?? 'GET');
+      return new Response(null, { status: init?.method === 'MKCOL' ? 405 : 204 });
+    }) as typeof fetch;
+
+    const provider = new WebDavProvider({ url: 'https://dav.example.test/sshx', username: 'u', password: 'p' });
+    await provider.push('backup');
+    assert.deepEqual(requests, ['MKCOL', 'PUT']);
   } finally {
     globalThis.fetch = originalFetch;
   }
