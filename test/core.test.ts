@@ -1,6 +1,8 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
 import ssh2 from 'ssh2';
@@ -516,6 +518,72 @@ test('SSHConnection: zero keepalive interval disables SSH2 keepalive', async con
   client.emit('ready');
   await pending;
   connection.disconnect();
+});
+
+test('SSHConnection: an immediate retry ignores the failed socket and keeps one responder', async () => {
+  const probe = net.createServer();
+  await new Promise<void>(resolve => probe.listen(0, '127.0.0.1', resolve));
+  const closedPort = (probe.address() as AddressInfo).port;
+  await new Promise<void>(resolve => probe.close(() => resolve()));
+
+  const connection = new SSHConnection({
+    profile: {
+      id: 'retry-keyboard', name: 'retry-keyboard', host: '127.0.0.1', port: closedPort,
+      username: 'testuser', authType: 'password', password: 'pw'
+    },
+    configManager,
+    knownHostsManager: testKnownHosts
+  });
+  try {
+    await assert.rejects(connection.connect(), /ECONNREFUSED/);
+    await assert.rejects(connection.connect(), /ECONNREFUSED/);
+    assert.equal(connection.getRawClient().listenerCount('keyboard-interactive'), 1);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(connection.getRawClient().listenerCount('error'), 0);
+  } finally {
+    connection.disconnect();
+  }
+});
+
+test('SSHConnection: forwards the banner and keyboard-interactive prompts to callbacks', async () => {
+  const server = new ssh2.Server({ hostKeys: [mockServer.hostKeyPem], banner: 'Authorized use only' }, client => {
+    client.on('error', () => {});
+    client.on('authentication', ctx => {
+      if (ctx.method !== 'keyboard-interactive') return ctx.reject(['keyboard-interactive']);
+      ctx.prompt([{ prompt: 'Verification code: ', echo: true }], answers => {
+        if (answers[0] === '424242') ctx.accept();
+        else ctx.reject();
+      });
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+
+  const banners: string[] = [];
+  const prompts: Array<{ prompt: string; echo: boolean }> = [];
+  const connection = new SSHConnection({
+    profile: {
+      id: 'keyboard-callback', name: 'keyboard-callback', host: '127.0.0.1', port,
+      username: 'testuser', authType: 'keyboard-interactive'
+    },
+    configManager,
+    knownHostsManager: testKnownHosts,
+    onBanner: message => banners.push(message),
+    onKeyboardInteractive: (_name, _instructions, _lang, asked, finish) => {
+      prompts.push(...asked);
+      finish(['424242']);
+    }
+  });
+  try {
+    await connection.connect();
+    assert.equal(connection.connected(), true);
+    assert.equal(banners.length, 1);
+    assert.match(banners[0], /Authorized use only/);
+    assert.deepEqual(prompts, [{ prompt: 'Verification code: ', echo: true }]);
+  } finally {
+    connection.disconnect();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });
 
 test('SSHConnection: handles a transport error after ready and closes before ready', async (context) => {

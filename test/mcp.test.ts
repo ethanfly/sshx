@@ -1,7 +1,11 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createMcpServer } from '../dist/skill/mcp-server.js';
 import { MockSSHServer } from './mock-server.ts';
+import { createIsolatedEnv } from './isolated-env.ts';
+
+const isolated = createIsolatedEnv('sshx-mcp-home-');
+Object.assign(process.env, isolated.env);
+const { createMcpServer } = await import('../dist/skill/mcp-server.js');
 
 let mockServer: MockSSHServer;
 let serverPort: number;
@@ -15,6 +19,7 @@ before(async () => {
 after(async () => {
   await mockServer.stop();
   delete process.env.SSH_PASSWORD;
+  isolated.cleanup();
 });
 
 test('MCP: creates server with SSH tools registered', () => {
@@ -24,6 +29,12 @@ test('MCP: creates server with SSH tools registered', () => {
   // Check registered tools via server instance
   const server = (mcp as any).server;
   assert.ok(server);
+});
+
+test('MCP: reports the installed package version', async () => {
+  const { default: pkg } = await import('../package.json', { with: { type: 'json' } });
+  const mcp = createMcpServer();
+  assert.equal((mcp as any).server._serverInfo.version, pkg.version);
 });
 
 test('MCP: ssh_generate_key generates Ed25519 keypair', async () => {

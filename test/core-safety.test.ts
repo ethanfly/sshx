@@ -9,6 +9,7 @@ import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import type { Client, ClientChannel, SFTPWrapper } from 'ssh2';
 import { execCommand, SFTPClient } from '../dist/index.js';
+import { createLinePrompter, readHiddenInput } from '../dist/cli/utils.js';
 
 function makeExecClient() {
   const channel = new EventEmitter();
@@ -702,4 +703,48 @@ test('SFTP rm stops when lstat does not identify the file type', async () => {
   });
 
   await assert.rejects(sftp.rm('/unknown', true), /Cannot determine remote file type/);
+});
+
+class FakeRawTty extends EventEmitter {
+  isRaw = false;
+  paused = true;
+  setRawMode(mode: boolean) { this.isRaw = mode; return this; }
+  resume() { this.paused = false; return this; }
+  pause() { this.paused = true; return this; }
+}
+
+test('readHiddenInput: masks typed and pasted secrets and submits on Enter inside a chunk', async () => {
+  const cases = [
+    ['s', 'e', 'c', 'r', 'e', 't', '\r'],
+    ['secret\r'],
+    ['secrex\x7ft\n'],
+    ['secret🔑\x7f\r']
+  ];
+  for (const chunks of cases) {
+    const input = new FakeRawTty();
+    let written = '';
+    const pending = readHiddenInput('pw: ', input, { write: (text: string) => { written += text; } });
+    for (const chunk of chunks) input.emit('data', Buffer.from(chunk));
+
+    assert.equal(await pending, 'secret');
+    assert.ok(written.startsWith('pw: '));
+    assert.match(written.slice('pw: '.length), /^(?:\*|\x08 \x08)*\n$/);
+    assert.equal(input.isRaw, false);
+    assert.equal(input.paused, true);
+    assert.equal(input.listenerCount('data'), 0);
+  }
+});
+
+test('createLinePrompter: answers successive prompts from one piped input and fails on EOF', async () => {
+  const input = Readable.from([Buffer.from('alpha\r\nbe'), Buffer.from('ta\n  secret  \nlast')]);
+  let written = '';
+  const ask = createLinePrompter(input, { write: (text: string) => { written += text; } });
+
+  assert.equal(await ask('1: '), 'alpha');
+  assert.equal(await ask('2: '), 'beta');
+  assert.equal(await ask('3: ', true), '  secret  ');
+  assert.equal(await ask('4: '), 'last');
+  await assert.rejects(ask('5: '), /Input ended before all prompts were answered/);
+  assert.equal(written, '1: 2: 3: 4: 5: ');
+  assert.equal(input.listenerCount('data'), 0);
 });

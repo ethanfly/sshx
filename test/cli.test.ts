@@ -6,10 +6,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { MockSSHServer } from './mock-server.ts';
+import { createIsolatedEnv } from './isolated-env.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const cliPath = path.join(__dirname, '..', 'bin', 'sshx.js');
+const isolated = createIsolatedEnv('sshx-cli-home-');
 
 let mockServer: MockSSHServer;
 let serverPort: number;
@@ -21,11 +23,13 @@ before(async () => {
 
 after(async () => {
   await mockServer.stop();
+  isolated.cleanup();
 });
 
 function runCli(args: string[], env: Record<string, string> = {}): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    execFile('node', [cliPath, ...args], { env: { ...process.env, SSH_PASSWORD: 'testpass', ...env } }, (error, stdout, stderr) => {
+    const childEnv = { ...process.env, ...isolated.env, SSH_PASSWORD: 'testpass', ...env };
+    execFile('node', [cliPath, ...args], { env: childEnv }, (error, stdout, stderr) => {
       resolve({
         stdout: stdout.toString(),
         stderr: stderr.toString(),
@@ -49,6 +53,13 @@ test('CLI: --help prints available subcommands', async () => {
   assert.ok(!res.stdout.includes('gui'));
   assert.ok(res.stdout.includes('mcp'));
   assert.ok(res.stdout.includes('skill'));
+});
+
+test('CLI: --version reports the installed package version', async () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const res = await runCli(['--version']);
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout.trim(), pkg.version);
 });
 
 test('CLI: keygen generates an Ed25519 key and refuses to overwrite it', async () => {

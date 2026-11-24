@@ -7,29 +7,42 @@ import { Client, ClientChannel, ConnectConfig, SyncHostVerifier } from 'ssh2';
 import { HostProfile, ConfigManager, defaultConfigManager, resolvePortablePath } from './config.js';
 import { KnownHostsManager } from './known-hosts.js';
 
+export type KeyboardInteractiveHandler = (
+  name: string,
+  instructions: string,
+  lang: string,
+  prompts: Array<{ prompt: string; echo: boolean }>,
+  finish: (responses: string[]) => void
+) => void;
+
 export interface ConnectionOptions {
   profile: HostProfile;
   configManager?: ConfigManager;
   knownHostsManager?: KnownHostsManager;
+  /** Receives the server's pre-authentication banner. */
   onBanner?: (message: string) => void;
-  onKeyboardInteractive?: (
-    name: string,
-    instructions: string,
-    lang: string,
-    prompts: Array<{ prompt: string; echo: boolean }>,
-    finish: (responses: string[]) => void
-  ) => void;
+  /** Answers keyboard-interactive prompts; password profiles default to the stored password. */
+  onKeyboardInteractive?: KeyboardInteractiveHandler;
 }
+
+const SECRET_PROMPT = /password|passphrase|密码|口令/i;
 
 export class SSHConnection {
   private client: Client;
   private profile: HostProfile;
   private configManager: ConfigManager;
   private knownHostsManager: KnownHostsManager;
+  private readonly onKeyboardInteractive?: KeyboardInteractiveHandler;
   private isConnected: boolean = false;
   private jumpConnection?: SSHConnection;
   private transportSocket?: ConnectConfig['sock'];
   private connecting?: Promise<void>;
+  /**
+   * ssh2 emits exactly one `close` per socket. Numbering sockets lets a retried
+   * handshake ignore the late `close` of a failed attempt's socket.
+   */
+  private socketsOpened = 0;
+  private socketsClosed = 0;
   private readonly jumpAncestors: ReadonlySet<string>;
 
   constructor(options: ConnectionOptions, jumpAncestors: ReadonlySet<string> = new Set()) {
@@ -38,6 +51,9 @@ export class SSHConnection {
     this.configManager = options.configManager || defaultConfigManager;
     this.knownHostsManager = options.knownHostsManager || new KnownHostsManager();
     this.jumpAncestors = jumpAncestors;
+    this.onKeyboardInteractive = options.onKeyboardInteractive;
+    this.client.on('close', () => { this.socketsClosed++; });
+    this.registerAuthListeners(options.onBanner);
   }
 
   public getRawClient(): Client {
@@ -50,6 +66,23 @@ export class SSHConnection {
 
   public connected(): boolean {
     return this.isConnected;
+  }
+
+  /**
+   * Registered once per client so connection retries never stack responders.
+   */
+  private registerAuthListeners(onBanner?: (message: string) => void): void {
+    if (onBanner) this.client.on('banner', message => onBanner(message));
+    this.client.on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
+      const respond = this.keyboardResponder();
+      if (!respond) return finish([]);
+      const normalized = prompts.map(({ prompt, echo }) => ({ prompt, echo: echo !== false }));
+      respond(name, instructions, lang, normalized, finish);
+    });
+  }
+
+  private keyboardResponder(): KeyboardInteractiveHandler | undefined {
+    return this.onKeyboardInteractive ?? storedPasswordResponder(this.profile);
   }
 
   /**
@@ -110,27 +143,41 @@ export class SSHConnection {
     }
     this.transportSocket = transportSocket;
 
-    // 3. Prepare SSH2 connect configuration
-    const connectConfig = this.buildConnectConfig(transportSocket);
+    await this.handshake(this.buildConnectConfig(transportSocket));
+  }
 
-    // 4. Perform SSH handshake
-    await new Promise<void>((resolve, reject) => {
+  /**
+   * Runs one SSH handshake. Its listeners stay until its own socket closes so
+   * late errors are absorbed, but once a newer attempt has started they no
+   * longer touch connection state.
+   */
+  private handshake(config: ConnectConfig): Promise<void> {
+    const socket = this.socketsOpened + 1;
+    const isCurrent = () => this.socketsOpened === socket;
+
+    return new Promise<void>((resolve, reject) => {
       let settled = false;
 
-      const rejectBeforeReady = (err: Error) => {
-        if (!settled) {
-          settled = true;
-          this.client.removeListener('ready', onReady);
-          reject(err);
-        }
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+
+      const detach = () => {
+        this.client.removeListener('error', onError);
+        this.client.removeListener('ready', onReady);
+        this.client.removeListener('close', onClose);
       };
 
       const onError = (err: Error) => {
+        if (!isCurrent()) return;
         this.cleanup();
-        rejectBeforeReady(err);
+        fail(err);
       };
 
       const onReady = () => {
+        if (settled || !isCurrent()) return;
         settled = true;
         this.isConnected = true;
         try {
@@ -142,21 +189,24 @@ export class SSHConnection {
       };
 
       const onClose = () => {
-        this.client.removeListener('error', onError);
-        this.cleanup();
-        if (!settled) rejectBeforeReady(new Error('SSH connection closed before authentication completed'));
+        if (this.socketsClosed < socket) return;
+        detach();
+        if (isCurrent()) this.cleanup();
+        fail(new Error('SSH connection closed before authentication completed'));
       };
 
       this.client.on('error', onError);
-      this.client.once('ready', onReady);
-      this.client.once('close', onClose);
+      this.client.on('ready', onReady);
+      this.client.on('close', onClose);
 
+      this.socketsOpened = socket;
       try {
-        this.client.connect(connectConfig);
+        this.client.connect(config);
       } catch (err) {
-        this.client.removeListener('error', onError);
-        this.client.removeListener('close', onClose);
-        onError(err instanceof Error ? err : new Error(String(err)));
+        this.socketsOpened = socket - 1;
+        detach();
+        this.cleanup();
+        fail(err instanceof Error ? err : new Error(String(err)));
       }
     });
   }
@@ -207,22 +257,12 @@ export class SSHConnection {
       }
     }) satisfies SyncHostVerifier;
 
-    // A stored password is used automatically. Keyboard-interactive is only
-    // enabled for password auth: ssh2 waits forever if a server advertises it
-    // and never answers, which would hang key-based connections.
-    const storedPassword = this.profile.password;
-    const useKeyboard = Boolean(storedPassword) && this.profile.authType !== 'privateKey' && this.profile.authType !== 'agent';
-    if (storedPassword) {
+    if (this.profile.password) {
       // ssh2 tries publickey first when a key is set, then falls back to this.
-      config.password = storedPassword;
+      config.password = this.profile.password;
     }
-    if (useKeyboard) {
+    if (this.keyboardResponder()) {
       config.tryKeyboard = true;
-      const answer = (prompt: string, echo: boolean) =>
-        /password|passphrase|密码|口令/i.test(prompt) || !echo ? storedPassword! : '';
-      this.client.on('keyboard-interactive', (_name, _instructions, _lang, prompts, finish) => {
-        finish(prompts.map(p => answer(p.prompt, p.echo !== false)));
-      });
     }
 
     // Authentication methods
@@ -354,4 +394,17 @@ export class SSHConnection {
 
 function resolvePath(filePath: string, baseDir?: string): string {
   return resolvePortablePath(filePath, baseDir);
+}
+
+/**
+ * A stored password answers keyboard-interactive prompts only for password
+ * profiles: ssh2 waits forever if a server advertises the method and nobody
+ * answers, which would hang key-based connections.
+ */
+function storedPasswordResponder(profile: HostProfile): KeyboardInteractiveHandler | undefined {
+  const { password, authType } = profile;
+  if (!password || authType === 'privateKey' || authType === 'agent') return undefined;
+  return (_name, _instructions, _lang, prompts, finish) => {
+    finish(prompts.map(({ prompt, echo }) => (SECRET_PROMPT.test(prompt) || !echo ? password : '')));
+  };
 }

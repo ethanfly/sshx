@@ -1,4 +1,6 @@
 import readline from 'node:readline';
+import type { Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 // ANSI styling helpers (works across Linux, macOS, Windows Terminal)
 export const colors = {
@@ -39,50 +41,149 @@ export const colors = {
 };
 
 export function prompt(questionText: string, hidden: boolean = false): Promise<string> {
+  if (!process.stdin.isTTY) {
+    pipedPrompt ??= createLinePrompter(process.stdin, process.stdout);
+    return pipedPrompt(questionText, hidden);
+  }
+  if (hidden) {
+    return readHiddenInput(questionText, process.stdin, process.stdout);
+  }
+
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
   });
-
   return new Promise((resolve) => {
-    if (hidden && process.stdin.isTTY) {
-      process.stdout.write(questionText);
-      const stdin = process.stdin;
-      const oldRaw = stdin.isRaw;
-      stdin.setRawMode(true);
-      stdin.resume();
+    rl.question(questionText, (ans) => {
+      rl.close();
+      resolve(ans.trim());
+    });
+  });
+}
 
-      let input = '';
-      const onData = (buf: Buffer) => {
-        const char = buf.toString('utf8');
-        if (char === '\n' || char === '\r' || char === '\u0004') {
-          stdin.setRawMode(oldRaw);
-          stdin.removeListener('data', onData);
-          process.stdout.write('\n');
-          rl.close();
-          resolve(input);
-        } else if (char === '\u0003') {
-          // Ctrl+C
-          stdin.setRawMode(oldRaw);
+export type LinePrompter = (questionText: string, exact?: boolean) => Promise<string>;
+
+let pipedPrompt: LinePrompter | undefined;
+
+/**
+ * Answers prompts from non-TTY input such as a pipe. Input is read only while
+ * a prompt waits, and text past the current line is kept for the next prompt.
+ * `exact` keeps surrounding whitespace, which matters for secrets.
+ */
+export function createLinePrompter(input: Readable, output: { write(text: string): unknown }): LinePrompter {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let ended = false;
+
+  const takeLine = (): string | undefined => {
+    const newline = pending.indexOf('\n');
+    if (newline === -1) {
+      if (!ended || !pending) return undefined;
+      const last = pending;
+      pending = '';
+      return last;
+    }
+    const line = pending.slice(0, newline).replace(/\r$/, '');
+    pending = pending.slice(newline + 1);
+    return line;
+  };
+
+  return (questionText, exact = false) => new Promise((resolve, reject) => {
+    output.write(questionText);
+
+    const stop = () => {
+      input.removeListener('data', onData);
+      input.removeListener('end', onEnd);
+      input.removeListener('error', onError);
+      input.pause();
+    };
+    const settle = (): boolean => {
+      const line = takeLine();
+      if (line === undefined && !ended) return false;
+      stop();
+      if (line === undefined) reject(new Error('Input ended before all prompts were answered.'));
+      else resolve(exact ? line : line.trim());
+      return true;
+    };
+    const onData = (chunk: Buffer | string) => {
+      pending += typeof chunk === 'string' ? chunk : decoder.write(chunk);
+      settle();
+    };
+    const onEnd = () => {
+      pending += decoder.end();
+      ended = true;
+      settle();
+    };
+    const onError = (error: Error) => {
+      stop();
+      reject(error);
+    };
+
+    if (input.readableEnded) ended = true;
+    if (settle()) return;
+    input.on('data', onData);
+    input.once('end', onEnd);
+    input.once('error', onError);
+    input.resume();
+  });
+}
+
+export interface RawInput {
+  isRaw?: boolean;
+  setRawMode(mode: boolean): unknown;
+  resume(): unknown;
+  pause(): unknown;
+  on(event: 'data', listener: (chunk: Buffer | string) => void): unknown;
+  removeListener(event: 'data', listener: (chunk: Buffer | string) => void): unknown;
+}
+
+/**
+ * Reads a secret from a raw TTY, echoing only `*`. Chunks are scanned per
+ * character so a pasted secret that ends in Enter still submits.
+ */
+export function readHiddenInput(
+  questionText: string,
+  input: RawInput,
+  output: { write(text: string): unknown }
+): Promise<string> {
+  return new Promise((resolve) => {
+    const wasRaw = input.isRaw === true;
+    let secret = '';
+
+    const restore = () => {
+      input.removeListener('data', onData);
+      input.setRawMode(wasRaw);
+      input.pause();
+      output.write('\n');
+    };
+
+    const onData = (chunk: Buffer | string) => {
+      for (const char of chunk.toString()) {
+        if (char === '\r' || char === '\n' || char === '\u0004') {
+          restore();
+          resolve(secret);
+          return;
+        }
+        if (char === '\u0003') {
+          restore();
           process.exit(130);
-        } else if (char === '\b' || char === '\x7f') {
-          // Backspace
-          if (input.length > 0) {
-            input = input.slice(0, -1);
-            process.stdout.write('\b \b');
+        }
+        if (char === '\b' || char === '\x7f') {
+          if (secret) {
+            secret = Array.from(secret).slice(0, -1).join('');
+            output.write('\b \b');
           }
         } else {
-          input += char;
-          process.stdout.write('*');
+          secret += char;
+          output.write('*');
         }
-      };
-      stdin.on('data', onData);
-    } else {
-      rl.question(questionText, (ans) => {
-        rl.close();
-        resolve(ans.trim());
-      });
-    }
+      }
+    };
+
+    output.write(questionText);
+    input.setRawMode(true);
+    input.resume();
+    input.on('data', onData);
   });
 }
 

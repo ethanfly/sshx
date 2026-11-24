@@ -2,11 +2,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { SkillTools } from './tools.js';
+import { packageVersion } from '../version.js';
 
 export function createMcpServer(): McpServer {
   const server = new McpServer({
     name: 'sshx-mcp-server',
-    version: '1.0.0'
+    version: packageVersion
   });
 
   // 1. List saved hosts
