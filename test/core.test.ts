@@ -458,6 +458,17 @@ test('SFTPClient: lists, writes, reads, and deletes remote files', async () => {
   const content = await sftp.readFile('hello.txt');
   assert.equal(content, 'Hello SFTP World!');
 
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-download-test-'));
+  try {
+    const localPath = path.join(downloadDir, 'hello.txt');
+    fs.writeFileSync(localPath, 'previous content');
+    await sftp.downloadFile('hello.txt', localPath);
+    assert.equal(fs.readFileSync(localPath, 'utf8'), content);
+    assert.deepEqual(fs.readdirSync(downloadDir), ['hello.txt']);
+  } finally {
+    fs.rmSync(downloadDir, { recursive: true, force: true });
+  }
+
   // List directory
   const files = await sftp.list('.');
   const found = files.find(f => f.filename === 'hello.txt');

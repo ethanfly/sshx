@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { pipeline } from 'node:stream/promises';
 import { Client, SFTPWrapper } from 'ssh2';
 
 export interface RemoteFileInfo {
@@ -28,6 +30,7 @@ export type ProgressCallback = (progress: TransferProgress) => void;
 export class SFTPClient {
   private client: Client;
   private sftpWrapper?: SFTPWrapper;
+  private sftpPromise?: Promise<SFTPWrapper>;
 
   constructor(client: Client) {
     this.client = client;
@@ -35,14 +38,24 @@ export class SFTPClient {
 
   public async getWrapper(): Promise<SFTPWrapper> {
     if (this.sftpWrapper) return this.sftpWrapper;
+    if (this.sftpPromise) return this.sftpPromise;
 
-    return new Promise<SFTPWrapper>((resolve, reject) => {
+    const pending = new Promise<SFTPWrapper>((resolve, reject) => {
       this.client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
         if (err) return reject(err);
         this.sftpWrapper = sftp;
+        sftp.once('close', () => {
+          if (this.sftpWrapper === sftp) this.sftpWrapper = undefined;
+        });
         resolve(sftp);
       });
     });
+    this.sftpPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.sftpPromise === pending) this.sftpPromise = undefined;
+    }
   }
 
   /**
@@ -125,8 +138,9 @@ export class SFTPClient {
     try {
       await this.stat(remotePath);
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (isMissingFile(error)) return false;
+      throw error;
     }
   }
 
@@ -153,23 +167,10 @@ export class SFTPClient {
     const sftp = await this.getWrapper();
 
     return new Promise<void>((resolve, reject) => {
-      const stream = sftp.createWriteStream(remotePath);
-      let done = false;
-      const onDone = () => {
-        if (!done) {
-          done = true;
-          resolve();
-        }
-      };
-      stream.once('finish', onDone);
-      stream.once('close', onDone);
-      stream.once('error', (err: Error) => {
-        if (!done) {
-          done = true;
-          reject(err);
-        }
+      sftp.writeFile(remotePath, content, (error) => {
+        if (error) reject(error);
+        else resolve();
       });
-      stream.end(Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8'));
     });
   }
 
@@ -187,30 +188,42 @@ export class SFTPClient {
     let bytesTransferred = 0;
     const startTime = Date.now();
 
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const readStream = fs.createReadStream(localPath);
       const writeStream = sftp.createWriteStream(remotePath);
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (error) {
+          readStream.destroy();
+          writeStream.destroy();
+          reject(error);
+        } else resolve();
+      };
 
       readStream.on('data', (chunk: Buffer) => {
         bytesTransferred += chunk.length;
         if (onProgress) {
           const elapsedSec = (Date.now() - startTime) / 1000 || 0.001;
-          const speedBps = Math.round(bytesTransferred / elapsedSec);
-          const percent = totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100;
           onProgress({
             bytesTransferred,
             totalBytes,
-            percent,
-            speedBps,
+            percent: totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100,
+            speedBps: Math.round(bytesTransferred / elapsedSec),
             currentFile: path.basename(localPath)
           });
         }
       });
 
-      writeStream.on('close', () => resolve());
-      writeStream.on('error', (err: Error) => reject(err));
-      readStream.on('error', (err: Error) => reject(err));
-
+      writeStream.once('close', () => {
+        const bytesWritten = (writeStream as typeof writeStream & { bytesWritten?: number }).bytesWritten;
+        finish(writeStream.errored ?? (bytesWritten === totalBytes
+          ? undefined
+          : new Error(`SFTP upload closed before completion: ${remotePath}`)));
+      });
+      writeStream.once('error', finish);
+      readStream.once('error', finish);
       readStream.pipe(writeStream);
     });
   }
@@ -234,32 +247,33 @@ export class SFTPClient {
       fs.mkdirSync(localDir, { recursive: true });
     }
 
-    return new Promise<void>((resolve, reject) => {
+    const temporaryPath = path.join(localDir, `.${path.basename(localPath)}.sshx-${randomUUID()}.tmp`);
+    try {
       const readStream = sftp.createReadStream(remotePath);
-      const writeStream = fs.createWriteStream(localPath);
-
+      const writeStream = fs.createWriteStream(temporaryPath, { flags: 'wx', mode: 0o666 });
       readStream.on('data', (chunk: Buffer) => {
         bytesTransferred += chunk.length;
         if (onProgress) {
           const elapsedSec = (Date.now() - startTime) / 1000 || 0.001;
-          const speedBps = Math.round(bytesTransferred / elapsedSec);
-          const percent = totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100;
           onProgress({
             bytesTransferred,
             totalBytes,
-            percent,
-            speedBps,
+            percent: totalBytes > 0 ? Math.min(100, Math.round((bytesTransferred / totalBytes) * 100)) : 100,
+            speedBps: Math.round(bytesTransferred / elapsedSec),
             currentFile: path.posix.basename(remotePath)
           });
         }
       });
-
-      writeStream.on('close', () => resolve());
-      writeStream.on('error', (err: Error) => reject(err));
-      readStream.on('error', (err: Error) => reject(err));
-
-      readStream.pipe(writeStream);
-    });
+      await pipeline(readStream, writeStream);
+      fs.renameSync(temporaryPath, localPath);
+    } catch (error) {
+      try {
+        fs.unlinkSync(temporaryPath);
+      } catch (cleanupError) {
+        if (!isMissingFile(cleanupError)) throw new AggregateError([error, cleanupError], `Failed to clean up partial download: ${localPath}`);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -282,14 +296,22 @@ export class SFTPClient {
 
     for (const part of parts) {
       current = path.posix.join(current, part);
-      const isPresent = await this.exists(current);
-      if (!isPresent) {
+      try {
+        const entry = await this.stat(current);
+        if (!entry.isDirectory) throw new Error(`Remote path is not a directory: ${current}`);
+        continue;
+      } catch (error) {
+        if (!isMissingFile(error)) throw error;
+      }
+      try {
         await new Promise<void>((resolve, reject) => {
-          sftp.mkdir(current, (err) => {
-            if (err && (err as any).code !== 4) return reject(err); // code 4 = SSH_FX_FAILURE (often already exists)
-            resolve();
-          });
+          sftp.mkdir(current, (err) => err ? reject(err) : resolve());
         });
+      } catch (error) {
+        if ((error as { code?: number }).code !== 4) throw error;
+        const createdByAnotherClient = await this.stat(current).then(entry => entry.isDirectory, () => false);
+        if (createdByAnotherClient) continue;
+        throw error;
       }
     }
   }
@@ -426,6 +448,11 @@ export class SFTPClient {
       }
     }
   }
+}
+
+function isMissingFile(error: unknown): boolean {
+  return (error as { code?: number | string } | null)?.code === 2
+    || (error as { code?: number | string } | null)?.code === 'ENOENT';
 }
 
 /**
