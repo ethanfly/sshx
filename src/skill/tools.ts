@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { defaultConfigManager, HostProfile } from '../core/config.js';
+import { defaultConfigManager, HostProfile, HostProfileUpdate, RedactedHostProfile, redactHostSecrets } from '../core/config.js';
 import { SSHConnection } from '../core/client.js';
 import { execCommand } from '../core/exec.js';
 import { SFTPClient } from '../core/sftp.js';
@@ -28,10 +28,11 @@ function withSftp<T>(hostOrTarget: string, work: (sftp: SFTPClient) => Promise<T
 
 export class SkillTools {
   /**
-   * List all saved host profiles
+   * List all saved host profiles (redacted by default)
    */
-  public static listHosts(): HostProfile[] {
-    return defaultConfigManager.getHosts();
+  public static listHosts(options: { includeSecrets?: boolean } = {}): Array<HostProfile | RedactedHostProfile> {
+    const hosts = defaultConfigManager.getHosts();
+    return options.includeSecrets ? hosts : hosts.map(redactHostSecrets);
   }
 
   /**
@@ -60,29 +61,18 @@ export class SkillTools {
   }
 
   /**
-   * Look up one host profile by id or name
+   * Look up one host profile by id or name (redacted by default)
    */
-  public static getHost(idOrName: string): HostProfile | undefined {
-    return defaultConfigManager.getHost(idOrName);
+  public static getHost(idOrName: string, options: { includeSecrets?: boolean } = {}): HostProfile | RedactedHostProfile | undefined {
+    const profile = defaultConfigManager.getHost(idOrName);
+    if (!profile) return undefined;
+    return options.includeSecrets ? profile : redactHostSecrets(profile);
   }
 
   /**
-   * Update an existing host profile. Passwords and key paths are stored as given.
+   * Update an existing host profile. Pass `null` on optional fields to clear them.
    */
-  public static updateHost(idOrName: string, updates: {
-    name?: string;
-    host?: string;
-    port?: number;
-    username?: string;
-    authType?: 'password' | 'privateKey' | 'agent' | 'keyboard-interactive';
-    password?: string;
-    privateKeyPath?: string;
-    passphrase?: string;
-    proxyJump?: string;
-    tags?: string[];
-    notes?: string;
-    favorite?: boolean;
-  }): HostProfile {
+  public static updateHost(idOrName: string, updates: HostProfileUpdate): HostProfile {
     const updated = defaultConfigManager.updateHost(idOrName, updates);
     if (!updated) {
       throw new Error(`Host profile '${idOrName}' not found`);
@@ -106,7 +96,7 @@ export class SkillTools {
    * List local SSH keys
    */
   public static listKeys(): ReturnType<typeof KeyManager.listAvailableKeys> {
-    return KeyManager.listAvailableKeys();
+    return KeyManager.listAvailableKeys(defaultConfigManager.getKeysDir());
   }
   public static async testConnection(hostOrTarget: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
     const profile = resolveTarget(hostOrTarget);
@@ -121,10 +111,13 @@ export class SkillTools {
     command: string,
     options: { timeout?: number; env?: Record<string, string> } = {}
   ): Promise<{ stdout: string; stderr: string; exitCode: number; durationMs: number }> {
-    return withConnection(hostOrTarget, connection => execCommand(connection.getRawClient(), command, {
-      timeout: options.timeout ? options.timeout * 1000 : 30000,
-      env: options.env
-    }));
+    return withConnection(hostOrTarget, (connection, profile) => {
+      const env = { ...profile.environment, ...options.env };
+      return execCommand(connection.getRawClient(), command, {
+        timeout: options.timeout ? options.timeout * 1000 : 30000,
+        env: Object.keys(env).length > 0 ? env : undefined
+      });
+    });
   }
 
   /**
@@ -178,20 +171,28 @@ export class SkillTools {
   public static downloadFile(
     hostOrTarget: string,
     remotePath: string,
-    localPath?: string
+    localPath?: string,
+    options: { maxBytes?: number } = {}
   ): Promise<{ content?: string; localPath?: string; size: number }> {
+    const maxBytes = localPath ? undefined : (options.maxBytes ?? 10 * 1024 * 1024);
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)) {
+      throw new RangeError('maxBytes must be a positive safe integer');
+    }
     return withSftp(hostOrTarget, async sftp => {
       const { size } = await sftp.stat(remotePath);
       if (localPath) {
         await sftp.downloadFile(remotePath, localPath);
         return { localPath, size };
       }
-      return { content: await sftp.readFile(remotePath), size };
+      if (maxBytes !== undefined && size > maxBytes) {
+        throw new Error(`Remote file '${remotePath}' (${size} bytes) exceeds maximum read size of ${maxBytes} bytes`);
+      }
+      return { content: await sftp.readFile(remotePath, 'utf8', maxBytes), size };
     });
   }
 
   /**
-   * Gather comprehensive system information from remote machine
+   * Gather comprehensive system information from remote machine over a single SSH exec channel
    */
   public static getSystemInfo(hostOrTarget: string): Promise<{
     host: string;
@@ -204,30 +205,38 @@ export class SkillTools {
     memory: string[];
     disk: string[];
   }> {
-    return withConnection(hostOrTarget, async (connection, profile) => {
-      const client = connection.getRawClient();
-      const run = async (cmd: string) => (await execCommand(client, cmd, { timeout: 10000 })).stdout.trim();
+    const probeScript = [
+      'printf "__SSHX_SECTION_OS__\\n"',
+      'cat /etc/os-release 2>/dev/null || sw_vers 2>/dev/null || uname -s',
+      'printf "__SSHX_SECTION_UNAME__\\n"',
+      'uname -a',
+      'printf "__SSHX_SECTION_UPTIME__\\n"',
+      'uptime',
+      'printf "__SSHX_SECTION_MEM__\\n"',
+      'free -h 2>/dev/null || vm_stat 2>/dev/null || echo "N/A"',
+      'printf "__SSHX_SECTION_DISK__\\n"',
+      'df -h / 2>/dev/null || df -h',
+      'printf "__SSHX_SECTION_CPU__\\n"',
+      'lscpu 2>/dev/null | grep -E "Model name|CPU\\(s\\):" || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "N/A"',
+      'printf "__SSHX_SECTION_HOST__\\n"',
+      'hostname'
+    ].join('\n');
+    const command = `sh -c '${probeScript.replace(/'/g, `'\\''`)}'`;
 
-      const [osInfo, uname, uptime, mem, disk, cpu, hostname] = await Promise.all([
-        run('cat /etc/os-release 2>/dev/null || sw_vers 2>/dev/null || uname -s'),
-        run('uname -a'),
-        run('uptime'),
-        run('free -h 2>/dev/null || vm_stat 2>/dev/null || echo "N/A"'),
-        run('df -h / 2>/dev/null || df -h'),
-        run('lscpu 2>/dev/null | grep -E "Model name|CPU\\(s\\):" || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "N/A"'),
-        run('hostname')
-      ]);
+    return withConnection(hostOrTarget, async (connection, profile) => {
+      const result = await execCommand(connection.getRawClient(), command, { timeout: 10000 });
+      const sections = parseSystemInfoSections(result.stdout);
 
       return {
         host: profile.host,
         username: profile.username,
-        hostname,
-        os: osInfo.split('\n')[0],
-        kernel: uname,
-        uptime,
-        cpu: cpu.split('\n').filter(Boolean),
-        memory: mem.split('\n').filter(Boolean),
-        disk: disk.split('\n').filter(Boolean)
+        hostname: sections.HOST.trim(),
+        os: (sections.OS.split('\n')[0] || '').trim(),
+        kernel: sections.UNAME.trim(),
+        uptime: sections.UPTIME.trim(),
+        cpu: sections.CPU.split('\n').map(line => line.trimEnd()).filter(Boolean),
+        memory: sections.MEM.split('\n').map(line => line.trimEnd()).filter(Boolean),
+        disk: sections.DISK.split('\n').map(line => line.trimEnd()).filter(Boolean)
       };
     });
   }
@@ -238,4 +247,35 @@ export class SkillTools {
   public static generateKey(options: { type?: 'ed25519' | 'rsa'; bits?: number; comment?: string }): KeyPairResult {
     return KeyManager.generateKeyPair(options);
   }
+}
+
+function parseSystemInfoSections(stdout: string): Record<'OS' | 'UNAME' | 'UPTIME' | 'MEM' | 'DISK' | 'CPU' | 'HOST', string> {
+  const sections: Record<'OS' | 'UNAME' | 'UPTIME' | 'MEM' | 'DISK' | 'CPU' | 'HOST', string> = {
+    OS: '',
+    UNAME: '',
+    UPTIME: '',
+    MEM: '',
+    DISK: '',
+    CPU: '',
+    HOST: ''
+  };
+  let current: keyof typeof sections | undefined;
+  let foundMarker = false;
+
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^__SSHX_SECTION_(OS|UNAME|UPTIME|MEM|DISK|CPU|HOST)__$/.exec(line.trim());
+    if (match) {
+      current = match[1] as keyof typeof sections;
+      foundMarker = true;
+      continue;
+    }
+    if (current) {
+      sections[current] = sections[current] ? `${sections[current]}\n${line}` : line;
+    }
+  }
+
+  if (!foundMarker && stdout.trim()) {
+    sections.UNAME = stdout.trim();
+  }
+  return sections;
 }

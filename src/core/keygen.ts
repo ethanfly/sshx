@@ -140,18 +140,26 @@ export class KeyManager {
   }
 
   /**
-   * List keys available in ~/.ssh and ~/.sshx/keys
+   * List keys available in ~/.ssh, configured keys dir, and legacy ~/.sshx/keys
    */
-  public static listAvailableKeys(additionalDir?: string): StoredKeyInfo[] {
-    const dirs = [
+  public static listAvailableKeys(additionalDir?: string | string[]): StoredKeyInfo[] {
+    const rawDirs = [
       path.join(os.homedir(), '.ssh'),
+      ...(Array.isArray(additionalDir) ? additionalDir : additionalDir ? [additionalDir] : []),
       path.join(os.homedir(), '.sshx', 'keys')
     ];
-    if (additionalDir && !dirs.includes(additionalDir)) {
-      dirs.push(additionalDir);
+    const dirs: string[] = [];
+    const seenDirs = new Set<string>();
+    for (const dir of rawDirs) {
+      const resolved = path.resolve(dir);
+      if (!seenDirs.has(resolved)) {
+        seenDirs.add(resolved);
+        dirs.push(resolved);
+      }
     }
 
     const keys: StoredKeyInfo[] = [];
+    const seenFiles = new Set<string>();
 
     for (const dir of dirs) {
       if (!fs.existsSync(dir)) continue;
@@ -164,13 +172,15 @@ export class KeyManager {
           }
 
           const fullPath = path.join(dir, file);
+          if (seenFiles.has(fullPath)) continue;
           const stat = fs.statSync(fullPath);
           if (!stat.isFile()) continue;
 
-          // Check if it's a private key
+          // Check if it's a private key without loading large unrelated files into memory
           try {
-            const head = fs.readFileSync(fullPath, 'utf8').slice(0, 100);
+            const head = readFileHead(fullPath, 128);
             if (head.includes('BEGIN') && head.includes('PRIVATE KEY')) {
+              seenFiles.add(fullPath);
               const pubPath = `${fullPath}.pub`;
               let type = 'unknown';
               let comment: string | undefined;
@@ -214,6 +224,17 @@ export class KeyManager {
     }
 
     return keys;
+  }
+}
+
+function readFileHead(filePath: string, maxBytes: number): string {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
   }
 }
 

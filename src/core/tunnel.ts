@@ -1,4 +1,4 @@
-import net from 'node:net';
+import net, { isIP } from 'node:net';
 import EventEmitter from 'node:events';
 import { Client, ClientChannel, TcpConnectionDetails, AcceptConnection, RejectConnection } from 'ssh2';
 import { errorMessage, toError } from './errors.js';
@@ -134,11 +134,26 @@ export class Tunnel extends EventEmitter {
       this.client.removeListener('tcp connection', this.remoteConnectionHandler);
       this.remoteConnectionHandler = undefined;
       await new Promise<void>((resolve) => {
-        try {
-          this.client.unforwardIn(this.config.remoteHost || '127.0.0.1', this.config.remotePort!, () => resolve());
-        } catch (error) {
-          if (!(error instanceof Error) || error.message !== 'Not connected') throw error;
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          this.client.removeListener('close', finish);
           resolve();
+        };
+        const timer = setTimeout(finish, 2000);
+        timer.unref?.();
+        this.client.once('close', finish);
+        try {
+          this.client.unforwardIn(this.config.remoteHost || '127.0.0.1', this.config.remotePort!, finish);
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== 'Not connected') {
+            clearTimeout(timer);
+            this.client.removeListener('close', finish);
+            throw error;
+          }
+          finish();
         }
       });
     }
@@ -217,6 +232,18 @@ export class Tunnel extends EventEmitter {
 
     const onTcpConnection = (details: TcpConnectionDetails, accept: AcceptConnection<ClientChannel>) => {
       if (details.destPort !== remoteBindPort) return;
+      if (
+        remoteBindHost !== '0.0.0.0' &&
+        remoteBindHost !== '::' &&
+        remoteBindHost !== '*' &&
+        remoteBindHost !== 'localhost' &&
+        details.destIP &&
+        details.destIP !== '0.0.0.0' &&
+        details.destIP !== '::' &&
+        details.destIP !== remoteBindHost
+      ) {
+        return;
+      }
 
       const stream = accept();
       const localSocket = net.connect(localTargetPort, localTargetHost, () => {
@@ -489,8 +516,10 @@ export function parsePortForwardString(spec: string, type: 'local' | 'remote' | 
     return parsed;
   };
 
+  const parts = splitForwardSpec(spec);
+  if (!parts) throw invalid();
+
   if (type === 'dynamic') {
-    const parts = spec.split(':');
     if (parts.length === 1) {
       return { id, type, localHost: '127.0.0.1', localPort: port(parts[0]) };
     }
@@ -498,7 +527,6 @@ export function parsePortForwardString(spec: string, type: 'local' | 'remote' | 
     return { id, type, localHost: parts[0], localPort: port(parts[1]) };
   }
 
-  const parts = spec.split(':');
   if (parts.length !== 3 && parts.length !== 4) {
     throw invalid();
   }
@@ -511,4 +539,42 @@ export function parsePortForwardString(spec: string, type: 'local' | 'remote' | 
   return type === 'local'
     ? { id, type, localHost: bindHost, localPort: bindPort, remoteHost: targetHost, remotePort: targetPort }
     : { id, type, localHost: targetHost, localPort: targetPort, remoteHost: bindHost, remotePort: bindPort };
+}
+
+function splitForwardSpec(spec: string): string[] | null {
+  if (!spec) return null;
+  const parts: string[] = [];
+  let i = 0;
+
+  while (i <= spec.length) {
+    if (spec[i] === '[') {
+      const close = spec.indexOf(']', i + 1);
+      if (close === -1) return null;
+      const ipv6 = spec.slice(i + 1, close);
+      if (isIP(ipv6) !== 6) return null;
+      parts.push(ipv6);
+      i = close + 1;
+      if (i === spec.length) break;
+      if (spec[i] !== ':') return null;
+      i++;
+      if (i === spec.length) {
+        parts.push('');
+        break;
+      }
+      continue;
+    }
+
+    const colon = spec.indexOf(':', i);
+    const segment = colon === -1 ? spec.slice(i) : spec.slice(i, colon);
+    if (segment.includes('[') || segment.includes(']')) return null;
+    parts.push(segment);
+    if (colon === -1) break;
+    i = colon + 1;
+    if (i === spec.length) {
+      parts.push('');
+      break;
+    }
+  }
+
+  return parts;
 }

@@ -70,7 +70,7 @@ test('MCP: ssh_add_host and ssh_list_hosts manages host profiles', async () => {
   });
   assert.ok(addRes.content[0].text.includes('mcp-prod'));
 
-  // List hosts
+  // List hosts (redacted by default)
   const listRes = await tools['ssh_list_hosts'].handler({});
   const list = JSON.parse(listRes.content[0].text);
   assert.ok(Array.isArray(list));
@@ -89,10 +89,26 @@ test('MCP: ssh_add_host and ssh_list_hosts manages host profiles', async () => {
     notes: 'updated'
   });
   assert.ok(updRes.content[0].text.includes('updated'));
+  assert.equal(updRes.content[0].text.includes('stored-secret'), false);
 
-  const after = JSON.parse((await tools['ssh_get_host'].handler({ host: 'mcp-prod' })).content[0].text);
-  assert.equal(after.password, 'stored-secret');
-  assert.equal(after.notes, 'updated');
+  const listAfterUpd = JSON.parse((await tools['ssh_list_hosts'].handler({})).content[0].text);
+  const foundAfterUpd = listAfterUpd.find((h: any) => h.name === 'mcp-prod');
+  assert.equal(foundAfterUpd.password, undefined);
+  assert.equal(foundAfterUpd.hasPassword, true);
+
+  const redactedGet = JSON.parse((await tools['ssh_get_host'].handler({ host: 'mcp-prod' })).content[0].text);
+  assert.equal(redactedGet.password, undefined);
+  assert.equal(redactedGet.hasPassword, true);
+  assert.equal(redactedGet.notes, 'updated');
+
+  const fullGet = JSON.parse((await tools['ssh_get_host'].handler({ host: 'mcp-prod', includeSecrets: true })).content[0].text);
+  assert.equal(fullGet.password, 'stored-secret');
+  assert.equal(fullGet.notes, 'updated');
+
+  await tools['ssh_update_host'].handler({ host: 'mcp-prod', password: null, notes: null });
+  const clearedGet = JSON.parse((await tools['ssh_get_host'].handler({ host: 'mcp-prod', includeSecrets: true })).content[0].text);
+  assert.equal(clearedGet.password, undefined);
+  assert.equal(clearedGet.notes, undefined);
 
   const delRes = await tools['ssh_delete_host'].handler({ host: 'mcp-prod' });
   assert.ok(delRes.content[0].text.includes('Deleted'));
@@ -152,5 +168,34 @@ test('MCP: ssh_system_info queries remote server specs', async () => {
   const info = JSON.parse(res.content[0].text);
   assert.equal(info.host, '127.0.0.1');
   assert.equal(info.username, 'testuser');
+  assert.equal(info.hostname, 'mock-sshx-test');
   assert.ok(info.kernel);
+});
+
+test('MCP: ssh_download_file enforces maxBytes when reading content directly', async () => {
+  const tools = (createMcpServer() as any)._registeredTools;
+  const host = `testuser@127.0.0.1:${serverPort}`;
+
+  const upRes = await tools['ssh_upload_file'].handler({
+    host,
+    remotePath: 'mcp-size-limit.txt',
+    content: '0123456789'
+  });
+  assert.equal(upRes.isError, undefined);
+
+  const tooLarge = await tools['ssh_download_file'].handler({
+    host,
+    remotePath: 'mcp-size-limit.txt',
+    maxBytes: 5
+  });
+  assert.equal(tooLarge.isError, true);
+  assert.match(tooLarge.content[0].text, /exceeds maximum read size/);
+
+  const ok = await tools['ssh_download_file'].handler({
+    host,
+    remotePath: 'mcp-size-limit.txt',
+    maxBytes: 20
+  });
+  assert.equal(ok.isError, undefined);
+  assert.equal(ok.content[0].text, '0123456789');
 });

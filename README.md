@@ -35,7 +35,7 @@
 
 - 密码、私钥（Ed25519 / RSA，可带口令）、SSH Agent 认证
 - 主机配置里保存的密码会在 CLI 和 TUI 连接时自动使用，不再询问
-- **分屏会话与实时监控看板**：连接后右侧实时展示 IP、账号、CPU、内存、硬盘、网络吞吐、NVIDIA 显卡状态，支持多路 CPU、多块硬盘、多网卡、多显卡；按 `F2` / `Ctrl+O` 自由折叠/展开
+- **分屏会话与实时监控看板**：连接后右侧实时展示 IP、账号、CPU、内存、硬盘、网络吞吐、NVIDIA 显卡状态，支持多路 CPU、多块硬盘、多网卡、多显卡；按 `F2` 自由折叠/展开（可在 `config.json` 中配置 `sidebarDefault` 与 `sidebarHotkey`）
 - **备用屏幕与边界隔离**：采用 Alternate Screen Buffer 与 DECAWM 终端防护，无缝隔绝历史滚动遮挡，像素级边框对齐
 - **端到端加密云同步（`sshx sync`）**：支持 WebDAV（坚果云 / Nextcloud / 群晖）与 GitHub Gist，AES-256-GCM 客户端加密保护
 - 主机增删改查，标签、备注、跳板机（ProxyJump）、ProxyCommand
@@ -195,6 +195,8 @@ sshx tunnel user@remote -R 9000:localhost:3000
 
 sshx ls
 sshx host list --json
+sshx host list --json --show-secrets
+sshx host show prod --json
 sshx host test prod
 sshx host import-ssh-config
 sshx host export hosts.json
@@ -242,20 +244,19 @@ sshx tui --sort fancy
 
 | 按键 | 作用 |
 |------|------|
-| 直接输入 | 实时搜索。空格分隔的词都要匹配名称、地址、用户、标签或备注 |
-| Backspace | 删掉最后一个搜索字符 |
+| `/` | 进入实时搜索模式（输入关键词，空格分隔表示 AND；支持粘贴；`Ctrl-U` 清空；`Esc` 退出搜索模式） |
 | ↑ ↓ / k j / Ctrl-K Ctrl-J | 移动 |
 | PgUp PgDn / Home End | 翻页、跳到头尾 |
 | Enter | 连接。已保存密码自动填入，结束后回到列表 |
 | a | 新建主机 |
-| e | 编辑选中主机 |
+| e | 编辑选中主机（清空可选字段后保存会清除原值） |
 | d | 删除（需要输入 `yes`） |
 | t | 测试延迟 |
-| S | 云同步（WebDAV / Gist） |
+| S | 云同步（选择 `pull` / `push` / `overwrite`，按需输入主密码） |
 | i | 导入 `~/.ssh/config` |
 | * | 收藏 / 取消收藏 |
 | Ctrl-R | 从磁盘重新加载 |
-| Esc | 先清空搜索，搜索为空时退出 |
+| Esc | 搜索模式下退出搜索；普通模式下先清空过滤词，无过滤词时退出 |
 | Ctrl-C | 退出 |
 
 新建和编辑表单里：Tab 或 ↑↓ 切换字段，Ctrl-S 保存，Esc 取消。密码显示为 `*`。
@@ -315,7 +316,7 @@ sshx tui --sort fancy
 终端高度不够时，看板会自动从详细视图切换到每设备一行的紧凑视图，所有设备都会列出；只有在实在放不下时才把末尾的设备折叠成 `… +N more`。
 
 - **分屏会话**：左侧为完整 PTY 远程交互终端，右侧为监视看板。
-- **快捷键**：会话中随时按 **`F2`** 或 **`Ctrl+O`**，即可一键折叠或展开右侧看板（折叠后终端铺满 100% 宽度）。
+- **快捷键**：会话中随时按 **`F2`** 即可一键折叠或展开右侧看板（折叠后终端铺满 100% 宽度；可在 `config.json` 设置 `"sidebarHotkey": "f2+ctrl-o"` 同时启用 `Ctrl+O`，或 `"sidebarDefault": "never"` 默认关闭）。
 - **命令行选项**：若不希望显示看板，添加 `--no-sidebar` 参数即可：
   ```bash
   sshx connect prod --no-sidebar
@@ -350,7 +351,7 @@ sshx sync setup --provider webdav \
   --password "your-app-token" \
   --passphrase "your-master-password"
 
-# 配置 GitHub Gist
+# 配置 GitHub Gist（可加 --no-save-passphrase 不落盘主密码，同步时通过 SSHX_SYNC_PASSPHRASE 提供）
 sshx sync setup --provider gist \
   --token "ghp_your_personal_access_token" \
   --passphrase "your-master-password"
@@ -406,15 +407,15 @@ sshx sync status
 
 工具：
 
-1. `ssh_list_hosts` 列出主机
-2. `ssh_get_host` 查看一台主机（含已存密码和密钥路径）
+1. `ssh_list_hosts` 列出主机（默认脱敏隐藏明文凭据）
+2. `ssh_get_host` 查看一台主机（默认脱敏，传入 `includeSecrets: true` 可读取已存凭据）
 3. `ssh_add_host` 新建
-4. `ssh_update_host` 修改
+4. `ssh_update_host` 修改（可选字段传 `null` 可清空）
 5. `ssh_delete_host` 删除
 6. `ssh_list_keys` 列出本机私钥
 7. `ssh_test_connection` 测连通和延迟
 8. `ssh_exec` 执行远程命令
-9. `ssh_sftp_list` / `ssh_upload_file` / `ssh_download_file` 文件操作
+9. `ssh_sftp_list` / `ssh_upload_file` / `ssh_download_file`（直读内容默认上限 10 MiB，可用 `maxBytes` 调整）文件操作
 10. `ssh_system_info` 查看系统信息
 11. `ssh_generate_key` 生成密钥
 
@@ -461,6 +462,18 @@ pnpm test
 `hosts.json` 里的密码是明文，只靠文件权限 `0600` 保护。不要把这个文件提交到 git，也不要放进共享目录以外的不受信任位置。导出文件同样包含密码。
 
 ## 版本历史
+
+### v1.2.15 (2026-11-25)
+
+- 🔐 **凭据脱敏与清空**：CLI 与 MCP 的 JSON 输出默认隐藏明文密码、私钥和密钥口令，仅在显式传入 `--show-secrets` 或 `includeSecrets` 时返回；编辑主机与 MCP 更新可用空值/`null` 清除可选凭据、代理和备注字段。
+- 🔑 **认证与连接**：加密私钥缺少口令时会安全提示输入；banner 与 keyboard-interactive 认证提示接入 CLI/SFTP/隧道/远程命令；直接连接支持 `defaultPort`、`defaultUsername`、`defaultKeyPath` 与 `id_ecdsa`，Windows 自动使用 OpenSSH Agent 管道。
+- 🔀 **ProxyJump**：支持逗号分隔的多跳代理与内联 `[user@]host[:port]`（含 IPv6），并正确传递交互认证回调、阻断循环跳转。
+- 🧩 **OpenSSH 导入**：支持 `Host *` 默认值、多别名 Host 块、等号语法、行内注释、Include 的位置与目录通配展开；`Match` 块不会误导入，端口和 keepalive 值严格校验。
+- 🖥️ **TUI**：`/` 进入独立搜索模式，搜索与表单支持粘贴和中文/emoji 光标编辑；表单字段过多时可滚动；编辑页可清空可选字段；云同步可选择 `pull`、`push` 或 `overwrite` 并按需输入主密码。
+- 📊 **监控看板**：补充 macOS 的 CPU、内存、网络与系统信息采集，连续失败后指数退避；侧边栏默认显示与快捷键可通过 `sidebarDefault`、`sidebarHotkey` 配置。
+- 📁 **SFTP 与隧道**：上传/下载目标已是目录时自动补全文件名；直接读取远端文件限制最大字节数；转发解析支持 IPv6 方括号写法，停止远程转发不再因服务器未回调而悬挂。
+- ☁️ **云同步**：`sync setup` 支持 `--no-save-passphrase`，未保存主密码时可通过 `SSHX_SYNC_PASSPHRASE` 提供；MCP 系统信息改为单通道采集，密钥扫描跳过大型非密钥文件。
+- 🧪 **回归验证**：修复 Windows 下 CLI 入口加载，整理测试专用依赖；全量 165 项测试通过。
 
 ### v1.2.14 (2026-11-24)
 

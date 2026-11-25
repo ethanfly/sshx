@@ -1,4 +1,6 @@
+import path from 'node:path';
 import { Command } from 'commander';
+import { defaultConfigManager } from '../core/config.js';
 import { defaultSyncManager, SyncConfig } from '../sync/manager.js';
 import { WebDavProvider, GistProvider } from '../sync/provider.js';
 import { colors, prompt } from './utils.js';
@@ -46,6 +48,8 @@ export function registerSyncCommand(program: Command): void {
     .option('--token <token>', 'GitHub Personal Access Token')
     .option('--gist-id <gistId>', 'Existing Gist ID (optional)')
     .option('--passphrase <passphrase>', 'E2EE master passphrase')
+    .option('--save-passphrase', 'Save passphrase locally in sync.json')
+    .option('--no-save-passphrase', 'Do not save passphrase locally in sync.json')
     .action(async (opts) => {
       await runSyncSetup(opts);
     });
@@ -83,6 +87,7 @@ export async function runSyncSetup(options: {
   token?: string;
   gistId?: string;
   passphrase?: string;
+  savePassphrase?: boolean;
 } = {}): Promise<void> {
   process.stdout.write(`\n${colors.bold}${colors.cyan}=== sshx Sync Setup (E2EE) ===${colors.reset}\n`);
   process.stdout.write(`${colors.dim}Your hosts configuration (including stored passwords & keys) will be encrypted client-side with AES-256-GCM before uploading.${colors.reset}\n\n`);
@@ -121,7 +126,11 @@ export async function runSyncSetup(options: {
     }
   } else {
     let token = options.token || (await prompt(`GitHub Personal Access Token: `, true));
-    let rawGistId = options.gistId || (await prompt(`Existing Gist ID (leave blank to auto-create, or paste 32-char hex ID): `));
+    let rawGistId = options.gistId !== undefined
+      ? options.gistId
+      : options.token !== undefined
+        ? ''
+        : (await prompt(`Existing Gist ID (leave blank to auto-create, or paste 32-char hex ID): `));
 
     let sanitizedGistId: string | undefined = undefined;
     const cleanGist = rawGistId.trim();
@@ -171,12 +180,21 @@ export async function runSyncSetup(options: {
     }
   }
 
-  const savePass = await prompt(`Save passphrase locally in ~/.config/sshx/sync.json? [Y/n]: `);
-  if (savePass.trim().toLowerCase() !== 'n') {
+  if (options.savePassphrase !== undefined) {
+    syncConfig.savePassphrase = options.savePassphrase;
+    if (options.savePassphrase) syncConfig.passphrase = passphrase;
+  } else if (options.passphrase !== undefined) {
     syncConfig.passphrase = passphrase;
     syncConfig.savePassphrase = true;
   } else {
-    syncConfig.savePassphrase = false;
+    const syncFileDisplay = path.join(defaultConfigManager.getConfigDir(), 'sync.json');
+    const savePass = await prompt(`Save passphrase locally in ${syncFileDisplay}? [Y/n]: `);
+    if (savePass.trim().toLowerCase() !== 'n') {
+      syncConfig.passphrase = passphrase;
+      syncConfig.savePassphrase = true;
+    } else {
+      syncConfig.savePassphrase = false;
+    }
   }
 
   defaultSyncManager.saveConfig(syncConfig);
@@ -191,7 +209,7 @@ export async function runSyncPush(passphrase?: string): Promise<void> {
     process.exit(1);
   }
 
-  let pass = passphrase || config.passphrase;
+  let pass = passphrase || config.passphrase || process.env.SSHX_SYNC_PASSPHRASE;
   if (!pass) {
     pass = await prompt(`Enter Master Passphrase: `, true);
   }
@@ -217,7 +235,7 @@ export async function runSyncPull(passphrase?: string, mode: 'merge' | 'overwrit
     process.exit(1);
   }
 
-  let pass = passphrase || config.passphrase;
+  let pass = passphrase || config.passphrase || process.env.SSHX_SYNC_PASSPHRASE;
   if (!pass) {
     pass = await prompt(`Enter Master Passphrase: `, true);
   }

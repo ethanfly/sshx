@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { SkillTools } from './tools.js';
 import { packageVersion } from '../version.js';
 import { errorMessage } from '../core/errors.js';
+import { redactHostSecrets } from '../core/config.js';
 
 interface ToolResult {
   [key: string]: unknown;
@@ -64,18 +65,19 @@ export function createMcpServer(): McpServer {
     },
     params => guarded(() => {
       const host = SkillTools.addHost(params);
-      return textResult(`Successfully added host profile '${host.name}' (${host.id})\n` + JSON.stringify(host, null, 2));
+      return textResult(`Successfully added host profile '${host.name}' (${host.id})\n` + JSON.stringify(redactHostSecrets(host), null, 2));
     })
   );
 
   server.tool(
     'ssh_get_host',
-    'Get one saved SSH host profile by id or name, including stored password and key path',
+    'Get one saved SSH host profile by id or name (credentials redacted by default)',
     {
-      host: z.string().describe('Host profile id or name')
+      host: z.string().describe('Host profile id or name'),
+      includeSecrets: z.boolean().optional().describe('Include stored plaintext credentials (default false)')
     },
-    ({ host }) => guarded(() => {
-      const profile = SkillTools.getHost(host);
+    ({ host, includeSecrets }) => guarded(() => {
+      const profile = SkillTools.getHost(host, { includeSecrets });
       return profile ? jsonResult(profile) : toolError(`Host profile '${host}' not found`);
     })
   );
@@ -90,17 +92,17 @@ export function createMcpServer(): McpServer {
       port: z.number().optional().describe('New SSH port'),
       username: z.string().optional().describe('New SSH username'),
       authType: z.enum(['password', 'privateKey', 'agent']).optional().describe('Authentication method'),
-      password: z.string().optional().describe('Password to store for password auth'),
-      privateKeyPath: z.string().optional().describe('Path to private key file'),
-      passphrase: z.string().optional().describe('Passphrase for an encrypted private key'),
-      proxyJump: z.string().optional().describe('Jump host profile name or id'),
+      password: z.string().nullable().optional().describe('Password to store (or null to clear)'),
+      privateKeyPath: z.string().nullable().optional().describe('Path to private key file (or null to clear)'),
+      passphrase: z.string().nullable().optional().describe('Passphrase for an encrypted private key (or null to clear)'),
+      proxyJump: z.string().nullable().optional().describe('Jump host profile name or id (or null to clear)'),
       tags: z.array(z.string()).optional().describe('Replacement tag list'),
-      notes: z.string().optional().describe('Notes'),
+      notes: z.string().nullable().optional().describe('Notes (or null to clear)'),
       favorite: z.boolean().optional().describe('Pin this host to the top of fancy sort')
     },
     ({ host, address, ...rest }) => guarded(() => {
       const updated = SkillTools.updateHost(host, { ...rest, host: address });
-      return textResult(`Updated host profile '${updated.name}' (${updated.id})\n` + JSON.stringify(updated, null, 2));
+      return textResult(`Updated host profile '${updated.name}' (${updated.id})\n` + JSON.stringify(redactHostSecrets(updated), null, 2));
     })
   );
 
@@ -185,10 +187,11 @@ export function createMcpServer(): McpServer {
     {
       host: targetParam,
       remotePath: z.string().describe('Source file path on remote server'),
-      localPath: z.string().optional().describe('Local destination path (if omitted, content is returned)')
+      localPath: z.string().optional().describe('Local destination path (if omitted, content is returned)'),
+      maxBytes: z.number().optional().describe('Maximum bytes to read when returning content directly (default 10485760)')
     },
-    ({ host, remotePath, localPath }) => guarded(async () => {
-      const res = await SkillTools.downloadFile(host, remotePath, localPath);
+    ({ host, remotePath, localPath, maxBytes }) => guarded(async () => {
+      const res = await SkillTools.downloadFile(host, remotePath, localPath, { maxBytes });
       return localPath
         ? textResult(`Successfully downloaded to ${res.localPath} (${res.size} bytes)`)
         : textResult(res.content || '');

@@ -179,13 +179,25 @@ test('CLI: host add, show, edit, list, export, import, and remove operations', a
   assert.equal(addRes.code, 0);
   assert.ok(addRes.stdout.includes(testHostName));
 
-  // 2. host show with --json
+  // 2. host show with --json (redacted by default, full with --show-secrets)
   const showRes = await runCli(['host', 'show', testHostName, '--json']);
   assert.equal(showRes.code, 0);
   const showData = JSON.parse(showRes.stdout);
   assert.equal(showData.name, testHostName);
   assert.equal(showData.port, serverPort);
   assert.deepEqual(showData.tags, ['ci-test', 'staging']);
+  assert.equal(showData.password, undefined);
+  assert.equal(showData.hasPassword, true);
+
+  const showSecretsRes = await runCli(['host', 'show', testHostName, '--json', '--show-secrets']);
+  assert.equal(showSecretsRes.code, 0);
+  assert.equal(JSON.parse(showSecretsRes.stdout).password, 'testpass');
+
+  const listRedactedRes = await runCli(['host', 'list', '--search', testHostName, '--json']);
+  assert.equal(listRedactedRes.code, 0);
+  const [listRedactedItem] = JSON.parse(listRedactedRes.stdout);
+  assert.equal(listRedactedItem.password, undefined);
+  assert.equal(listRedactedItem.hasPassword, true);
 
   // 3. direct connection using configured host name
   const execDirectRes = await runCli([
@@ -216,6 +228,11 @@ test('CLI: host add, show, edit, list, export, import, and remove operations', a
   const verifyData = JSON.parse(verifyEditRes.stdout);
   assert.equal(verifyData.username, 'testuser-updated');
   assert.equal(verifyData.notes, 'Updated notes');
+
+  const clearNotesRes = await runCli(['host', 'edit', testHostName, '--notes', '']);
+  assert.equal(clearNotesRes.code, 0);
+  const verifyClearRes = await runCli(['host', 'show', testHostName, '--json']);
+  assert.equal(JSON.parse(verifyClearRes.stdout).notes, undefined);
 
   // 5. host list with --search and top-level hosts shortcut
   const searchRes = await runCli(['host', 'list', '--search', testHostName, '--json']);
@@ -372,5 +389,56 @@ test('CLI: running bare sshx defaults to TUI', async () => {
   });
 
   assert.ok(res.launched, 'Bare sshx command should launch TUI by default');
+});
+
+test('CLI: sync setup with flags completes non-interactively and honors --no-save-passphrase', async () => {
+  const tempCfg = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-cli-sync-setup-'));
+  try {
+    const res = await runCli([
+      'sync', 'setup',
+      '--provider', 'gist',
+      '--token', 'ghp_non_interactive_test_token',
+      '--passphrase', 'master-pass',
+      '--no-save-passphrase'
+    ], { SSHX_CONFIG_DIR: tempCfg });
+    assert.equal(res.code, 0, res.stderr);
+    const saved = JSON.parse(fs.readFileSync(path.join(tempCfg, 'sync.json'), 'utf8'));
+    assert.equal(saved.provider, 'gist');
+    assert.equal(saved.gist.token, 'ghp_non_interactive_test_token');
+    assert.equal(saved.savePassphrase, false);
+    assert.equal(saved.passphrase, undefined);
+  } finally {
+    fs.rmSync(tempCfg, { recursive: true, force: true });
+  }
+});
+
+test('CLI: sftp put/get auto-append basename when destination is an existing directory', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-cli-sftp-dir-'));
+  const localSrc = path.join(tempDir, 'sample.txt');
+  const localOutDir = path.join(tempDir, 'out');
+  fs.writeFileSync(localSrc, 'dir-transfer-ok');
+  fs.mkdirSync(localOutDir);
+  fs.mkdirSync(path.join(mockServer.tempDir, 'inbox'), { recursive: true });
+  try {
+    const putRes = await runCli([
+      'sftp', 'put',
+      `testuser@127.0.0.1:${serverPort}`,
+      localSrc,
+      'inbox'
+    ]);
+    assert.equal(putRes.code, 0, putRes.stderr);
+    assert.equal(fs.readFileSync(path.join(mockServer.tempDir, 'inbox', 'sample.txt'), 'utf8'), 'dir-transfer-ok');
+
+    const getRes = await runCli([
+      'sftp', 'get',
+      `testuser@127.0.0.1:${serverPort}`,
+      'inbox/sample.txt',
+      localOutDir
+    ]);
+    assert.equal(getRes.code, 0, getRes.stderr);
+    assert.equal(fs.readFileSync(path.join(localOutDir, 'sample.txt'), 'utf8'), 'dir-transfer-ok');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 

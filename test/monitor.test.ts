@@ -99,7 +99,11 @@ test('SplitSession: sidebar polling follows visibility and stops at session clos
     context.mock.timers.tick(5000);
     assert.strictEqual(exec.mock.callCount(), 2);
 
+    // Default toggleHotkey ('f2') leaves Ctrl+O (\x0f) forwarded to the shell
     input.emit('data', Buffer.from('\x0f'));
+    assert.strictEqual(exec.mock.callCount(), 2);
+
+    input.emit('data', Buffer.from('\x1bOQ'));
     assert.strictEqual(exec.mock.callCount(), 3);
   } finally {
     channel.emit('close');
@@ -107,6 +111,30 @@ test('SplitSession: sidebar polling follows visibility and stops at session clos
   await flushPoll();
   context.mock.timers.tick(5000);
   assert.strictEqual(exec.mock.callCount(), 3);
+});
+
+test('SplitSession: toggleHotkey f2+ctrl-o allows Ctrl+O to toggle sidebar', async (context) => {
+  const input = Object.assign(new EventEmitter(), { isTTY: true, setRawMode() {}, pause() {}, resume() {} });
+  const output = Object.assign(new EventEmitter(), { isTTY: true, columns: 110, rows: 30, write() {} });
+  context.mock.getter(process, 'stdin', () => input as unknown as typeof process.stdin);
+  context.mock.getter(process, 'stdout', () => output as unknown as typeof process.stdout);
+  const channel = mockChannel();
+  const exec = context.mock.fn((_command, _options, callback) => callback(new Error('metrics unavailable')));
+  const session = new SplitSession(Object.assign(new EventEmitter(), {
+    exec,
+    shell(_options: unknown, callback: (error: undefined, channel: ReturnType<typeof mockChannel>) => void) {
+      callback(undefined, channel);
+    }
+  }) as any, { enableSidebar: false, toggleHotkey: 'f2+ctrl-o' });
+
+  await session.start();
+  try {
+    session.attachToLocalProcess();
+    input.emit('data', Buffer.from('\x0f'));
+    assert.strictEqual(exec.mock.callCount(), 1);
+  } finally {
+    channel.emit('close');
+  }
 });
 
 test('SplitSession: redirected output disables sidebar polling and leaves hotkeys as input', async (context) => {
@@ -558,4 +586,57 @@ test('padClip: clipping colored text keeps escape sequences whole and width exac
   // Dropping a double-width char must not leave the cell short
   assert.strictEqual(stringWidth(padClip('中文字', 5)), 5);
   assert.strictEqual(padClip('中文字', 5), '中文…');
+});
+
+test('MetricsCollector: backs off after consecutive failures and parses macOS CPUPCT', async (context) => {
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  let shouldFail = true;
+  let calls = 0;
+  let capturedCommand = '';
+  const collector = new MetricsCollector(Object.assign(new EventEmitter(), {
+    exec(command: string, _options: unknown, callback: (err?: Error, ch?: ReturnType<typeof mockChannel>) => void) {
+      calls++;
+      capturedCommand = command;
+      if (shouldFail) {
+        callback(new Error('unsupported'));
+        return;
+      }
+      const ch = mockChannel();
+      callback(undefined, ch);
+      ch.emit('data', Buffer.from('HOST=mac-mini\nOS=macOS\nCPUSTAT=\nCPUPCT=37.4\nMT=16384\nMU=8192\n'));
+      ch.emit('exit', 0);
+      ch.emit('close');
+    }
+  }) as any, 25);
+
+  try {
+    collector.start();
+    assert.ok(capturedCommand.startsWith("sh -c '"));
+    await flushPoll();
+    assert.strictEqual(calls, 1);
+
+    // 1st failure retries on next tick
+    context.mock.timers.tick(25);
+    await flushPoll();
+    assert.strictEqual(calls, 2);
+
+    // 2nd failure skips 1 tick
+    context.mock.timers.tick(25);
+    await flushPoll();
+    assert.strictEqual(calls, 2);
+
+    shouldFail = false;
+    context.mock.timers.tick(25);
+    await flushPoll();
+    assert.strictEqual(calls, 3);
+    assert.strictEqual(collector.getLatest()?.cpu.usagePercent, 37.4);
+    assert.strictEqual(collector.getLatest()?.memory.percent, 50);
+
+    // After success, backoff resets
+    context.mock.timers.tick(25);
+    await flushPoll();
+    assert.strictEqual(calls, 4);
+  } finally {
+    collector.stop();
+  }
 });

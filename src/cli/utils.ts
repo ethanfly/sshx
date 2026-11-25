@@ -1,6 +1,7 @@
 import readline from 'node:readline';
 import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
+import { stringWidth } from '../core/text-width.js';
 
 // ANSI styling helpers (works across Linux, macOS, Windows Terminal)
 export const colors = {
@@ -188,14 +189,20 @@ export function readHiddenInput(
 }
 
 /**
- * Format bytes to readable string (KB, MB, GB)
+ * Format bytes to readable string (B, KB, MB, GB, TB, PB)
  */
 export function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)));
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
+}
+
+function padDisplayEnd(text: string, targetWidth: number): string {
+  const pad = Math.max(0, targetWidth - stringWidth(text));
+  return `${text}${' '.repeat(pad)}`;
 }
 
 /**
@@ -203,19 +210,19 @@ export function formatBytes(bytes: number): string {
  */
 export function renderTable(headers: string[], rows: string[][]): string {
   const colWidths = headers.map((h, i) => {
-    const maxRow = rows.reduce((max, r) => Math.max(max, (r[i] || '').length), 0);
-    return Math.max(h.length, maxRow);
+    const maxRow = rows.reduce((max, r) => Math.max(max, stringWidth(r[i] || '')), 0);
+    return Math.max(stringWidth(h), maxRow);
   });
 
   const sep = colWidths.map(w => '─'.repeat(w + 2)).join('┼');
-  const headerLine = headers.map((h, i) => ` ${colors.bold}${h.padEnd(colWidths[i])}${colors.reset} `).join('│');
+  const headerLine = headers.map((h, i) => ` ${colors.bold}${padDisplayEnd(h, colWidths[i])}${colors.reset} `).join('│');
   const renderedRows = rows.map(row => {
-    return row.map((cell, i) => ` ${(cell || '').padEnd(colWidths[i])} `).join('│');
+    return row.map((cell, i) => ` ${padDisplayEnd(cell || '', colWidths[i])} `).join('│');
   });
 
   return [
     headerLine,
-    `┼${sep}┼`,
+    sep,
     ...renderedRows
   ].join('\n');
 }

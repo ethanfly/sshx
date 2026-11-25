@@ -9,7 +9,8 @@ import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import type { Client, ClientChannel, SFTPWrapper } from 'ssh2';
 import { execCommand, SFTPClient } from '../dist/index.js';
-import { createLinePrompter, readHiddenInput } from '../dist/cli/utils.js';
+import { createLinePrompter, formatBytes, readHiddenInput, renderTable } from '../dist/cli/utils.js';
+import { stringWidth } from '../dist/tui/screen.js';
 import { errorMessage, toError } from '../dist/core/errors.js';
 
 function makeExecClient() {
@@ -759,4 +760,40 @@ test('errorMessage and toError normalize any thrown value', () => {
   const original = new Error('kept');
   assert.equal(toError(original), original);
   assert.deepEqual([toError('text') instanceof Error, toError('text').message], [true, 'text']);
+});
+
+test('SFTPClient.readFile enforces maxBytes and destroys stream on overflow', async () => {
+  let destroyed = false;
+  const sftp = makeSftpClient({
+    createReadStream() {
+      const stream = Readable.from([Buffer.from('1234'), Buffer.from('5678')]) as ReturnType<SFTPWrapper['createReadStream']> & { destroy: () => void };
+      const origDestroy = stream.destroy.bind(stream);
+      stream.destroy = () => {
+        destroyed = true;
+        return origDestroy();
+      };
+      return stream;
+    }
+  });
+
+  await assert.rejects(sftp.readFile('/big.log', 'utf8', 0), /positive safe integer/);
+  await assert.rejects(sftp.readFile('/big.log', 'utf8', 5), /exceeded maximum read size of 5 bytes/);
+  assert.equal(destroyed, true);
+  assert.equal(await sftp.readFile('/big.log', 'utf8', 8), '12345678');
+});
+
+test('renderTable aligns ANSI-colored and CJK cells by display width and formatBytes handles bounds', () => {
+  const table = renderTable(['名称', 'Status'], [
+    ['测试服务器', '\x1b[32mRUNNING\x1b[0m'],
+    ['api-01', '\x1b[34mdir/\x1b[0m']
+  ]);
+  const lines = table.split('\n');
+  const widths = lines.map(line => stringWidth(line));
+  assert.equal(new Set(widths).size, 1, `All table rows must have equal display width: ${JSON.stringify(widths)}`);
+
+  assert.equal(formatBytes(0), '0 B');
+  assert.equal(formatBytes(-10), '0 B');
+  assert.equal(formatBytes(Number.NaN), '0 B');
+  assert.equal(formatBytes(512), '512 B');
+  assert.equal(formatBytes(2 * 1024 ** 5), '2 PB');
 });

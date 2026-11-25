@@ -154,16 +154,40 @@ export class SFTPClient {
   /**
    * Read remote file content
    */
-  public async readFile(remotePath: string, encoding: BufferEncoding = 'utf8'): Promise<string> {
+  public async readFile(remotePath: string, encoding: BufferEncoding = 'utf8', maxBytes?: number): Promise<string> {
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)) {
+      throw new RangeError('maxBytes must be a positive safe integer');
+    }
     const sftp = await this.getWrapper();
 
     return new Promise<string>((resolve, reject) => {
       const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let settled = false;
       const stream = sftp.createReadStream(remotePath);
 
-      stream.on('data', (chunk: Buffer) => chunks.push(chunk));
-      stream.on('end', () => resolve(Buffer.concat(chunks).toString(encoding)));
-      stream.on('error', (err: Error) => reject(err));
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        stream.destroy();
+        reject(err);
+      };
+
+      stream.on('data', (chunk: Buffer) => {
+        if (settled) return;
+        totalBytes += chunk.length;
+        if (maxBytes !== undefined && totalBytes > maxBytes) {
+          fail(new Error(`Remote file '${remotePath}' exceeded maximum read size of ${maxBytes} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      stream.on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve(Buffer.concat(chunks).toString(encoding));
+      });
+      stream.on('error', (err: Error) => fail(err));
     });
   }
 

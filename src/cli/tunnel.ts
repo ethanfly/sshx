@@ -1,4 +1,4 @@
-import { resolveTarget, ConnectCliOptions } from './connect.js';
+import { resolveTarget, prepareCliConnection, ConnectCliOptions } from './connect.js';
 import { SSHConnection } from '../core/client.js';
 import { TunnelManager, parsePortForwardString } from '../core/tunnel.js';
 import { colors, formatBytes, renderTable } from './utils.js';
@@ -26,7 +26,7 @@ export async function runTunnel(target: string, options: TunnelCliOptions = {}):
     return;
   }
 
-  const conn = new SSHConnection({ profile });
+  const conn = new SSHConnection(await prepareCliConnection(profile));
   const client = conn.getRawClient();
   const tm = new TunnelManager(client);
   let userStopped = false;

@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { defaultConfigManager, DuplicateHostError, HostProfile, resolvePortablePath } from '../core/config.js';
+import { defaultConfigManager, DuplicateHostError, HostProfile, HostProfileUpdate, redactHostSecrets, resolvePortablePath } from '../core/config.js';
 import { SSHConnection } from '../core/client.js';
 import { colors, prompt, renderTable } from './utils.js';
 import { errorMessage } from '../core/errors.js';
 
 export interface HostListCliOptions {
   json?: boolean;
+  showSecrets?: boolean;
   tag?: string;
   search?: string;
 }
@@ -25,13 +26,15 @@ export async function runHostList(options: HostListCliOptions = {}): Promise<voi
       h.name.toLowerCase().includes(q) ||
       h.host.toLowerCase().includes(q) ||
       h.username.toLowerCase().includes(q) ||
+      (h.group && h.group.toLowerCase().includes(q)) ||
       (h.notes && h.notes.toLowerCase().includes(q)) ||
       (h.tags && h.tags.some(t => t.toLowerCase().includes(q)))
     );
   }
 
   if (options.json) {
-    process.stdout.write(JSON.stringify(hosts, null, 2) + '\n');
+    const output = options.showSecrets ? hosts : hosts.map(redactHostSecrets);
+    process.stdout.write(JSON.stringify(output, null, 2) + '\n');
     return;
   }
 
@@ -101,11 +104,14 @@ export async function runHostAdd(options: HostAddCliOptions = {}): Promise<void>
       host = await prompt(`${colors.bold}Hostname or IP:${colors.reset} `);
     }
 
-    const userAns = await prompt(`${colors.bold}Username (default: ${existing?.username ?? 'root'}):${colors.reset} `);
-    username = userAns.trim() || username;
+    const appConfig = defaultConfigManager.getAppConfig();
+    const userAns = await prompt(`${colors.bold}Username (default: ${existing?.username ?? appConfig.defaultUsername}):${colors.reset} `);
+    username = userAns.trim() || username || (!existing ? appConfig.defaultUsername : undefined);
 
-    const portAns = await prompt(`${colors.bold}Port (default: ${existing?.port ?? 22}):${colors.reset} `);
+    const defaultPort = existing?.port ?? appConfig.defaultPort ?? 22;
+    const portAns = await prompt(`${colors.bold}Port (default: ${defaultPort}):${colors.reset} `);
     if (portAns.trim()) port = Number(portAns);
+    else if (!existing && port === undefined) port = appConfig.defaultPort;
 
     const sameEndpoint = existing && host === existing.host &&
       (username ?? existing.username) === existing.username && (port ?? existing.port) === existing.port;
@@ -117,7 +123,7 @@ export async function runHostAdd(options: HostAddCliOptions = {}): Promise<void>
       const passwordAns = await prompt(`${colors.bold}Password:${colors.reset} `, true);
       password = passwordAns || password;
     } else if (authType === 'privateKey') {
-      const keyDefault = privateKeyPath ?? (sameEndpoint ? existing.privateKeyPath : undefined) ?? '~/.ssh/id_ed25519';
+      const keyDefault = privateKeyPath ?? (sameEndpoint ? existing.privateKeyPath : undefined) ?? appConfig.defaultKeyPath ?? '~/.ssh/id_ed25519';
       const keyAns = await prompt(`${colors.bold}Private key path (default: ${keyDefault}):${colors.reset} `);
       privateKeyPath = keyAns.trim() || privateKeyPath || (sameEndpoint && existing.privateKey ? undefined : keyDefault);
     }
@@ -202,7 +208,7 @@ export async function runHostEdit(idOrName: string, options: HostEditCliOptions 
     options.proxyJump !== undefined ||
     options.jump !== undefined;
 
-  let updates: Partial<HostProfile> = {};
+  let updates: HostProfileUpdate = {};
 
   if (hasFlags) {
     if (options.name !== undefined) updates.name = options.name;
@@ -210,12 +216,15 @@ export async function runHostEdit(idOrName: string, options: HostEditCliOptions 
     if (options.port !== undefined) updates.port = Number(options.port);
     if (options.username !== undefined || options.user !== undefined) updates.username = options.username || options.user;
     if (options.authType !== undefined || options.auth !== undefined) updates.authType = parseAuthType(options.authType ?? options.auth);
-    if (options.password !== undefined) updates.password = options.password;
+    if (options.password !== undefined) updates.password = options.password === '' ? null : options.password;
     const privateKeyPath = options.privateKeyPath ?? options.identity ?? options.key;
-    if (privateKeyPath !== undefined) updates.privateKeyPath = privateKeyPath;
+    if (privateKeyPath !== undefined) updates.privateKeyPath = privateKeyPath === '' ? null : privateKeyPath;
     if (options.tags !== undefined) updates.tags = options.tags;
-    if (options.notes !== undefined) updates.notes = options.notes;
-    if (options.proxyJump !== undefined || options.jump !== undefined) updates.proxyJump = options.proxyJump ?? options.jump;
+    if (options.notes !== undefined) updates.notes = options.notes === '' ? null : options.notes;
+    if (options.proxyJump !== undefined || options.jump !== undefined) {
+      const jumpVal = options.proxyJump ?? options.jump;
+      updates.proxyJump = jumpVal === '' ? null : jumpVal;
+    }
   } else if (process.stdin.isTTY) {
     // Interactive edit wizard
     process.stdout.write(`${colors.bold}${colors.cyan}=== Edit Host Profile: ${current.name} ===${colors.reset}\n`);
@@ -294,7 +303,7 @@ export async function runHostRemove(idOrName: string, options: { force?: boolean
   }
 }
 
-export async function runHostShow(idOrName: string, options: { json?: boolean } = {}): Promise<void> {
+export async function runHostShow(idOrName: string, options: { json?: boolean; showSecrets?: boolean } = {}): Promise<void> {
   const profile = defaultConfigManager.getHost(idOrName);
   if (!profile) {
     printHostNotFound(idOrName);
@@ -302,7 +311,8 @@ export async function runHostShow(idOrName: string, options: { json?: boolean } 
   }
 
   if (options.json) {
-    process.stdout.write(JSON.stringify(profile, null, 2) + '\n');
+    const output = options.showSecrets ? profile : redactHostSecrets(profile);
+    process.stdout.write(JSON.stringify(output, null, 2) + '\n');
     return;
   }
 
@@ -324,6 +334,9 @@ export async function runHostShow(idOrName: string, options: { json?: boolean } 
   }
   if (profile.proxyCommand) {
     process.stdout.write(`  ${colors.bold}ProxyCommand:${colors.reset}   ${profile.proxyCommand}\n`);
+  }
+  if (profile.group) {
+    process.stdout.write(`  ${colors.bold}Group:${colors.reset}          ${profile.group}\n`);
   }
   process.stdout.write(`  ${colors.bold}Tags:${colors.reset}           ${(profile.tags || []).join(', ') || '-'}\n`);
   if (profile.notes) {

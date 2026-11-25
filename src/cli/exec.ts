@@ -1,4 +1,4 @@
-import { resolveTarget, ConnectCliOptions } from './connect.js';
+import { resolveTarget, prepareCliConnection, ConnectCliOptions } from './connect.js';
 import { SSHConnection } from '../core/client.js';
 import { HostProfile } from '../core/config.js';
 import { execCommand } from '../core/exec.js';
@@ -24,10 +24,11 @@ export async function runExec(
     process.stderr.write(`${colors.red}Error: ${errorMessage(err)}${colors.reset}\n`);
     process.exit(1);
   }
-  const connection = new SSHConnection({ profile });
+  const connectionOptions = await prepareCliConnection(profile);
+  const connection = new SSHConnection(connectionOptions);
 
   try {
-    const envMap: Record<string, string> = Object.create(null);
+    const envMap: Record<string, string> = Object.assign(Object.create(null), profile.environment ?? {});
     if (options.env) {
       for (const item of options.env) {
         const separator = item.indexOf('=');

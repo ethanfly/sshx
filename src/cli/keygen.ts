@@ -1,5 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
+import { defaultConfigManager } from '../core/config.js';
 import { GeneratedKeyFiles, KeyManager } from '../core/keygen.js';
 import { colors, prompt } from './utils.js';
 
@@ -17,7 +18,7 @@ export async function runKeygen(options: KeygenCliOptions = {}): Promise<void> {
 
   let filePath = options.file;
   if (!filePath) {
-    const defaultPath = path.join(os.homedir(), '.sshx', 'keys', `id_${type}`);
+    const defaultPath = path.join(defaultConfigManager.getKeysDir(), `id_${type}`);
     const inputPath = await prompt(`${colors.bold}Enter file in which to save the key (${defaultPath}):${colors.reset} `);
     filePath = inputPath || defaultPath;
   }

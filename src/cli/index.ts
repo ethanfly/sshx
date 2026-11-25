@@ -164,6 +164,7 @@ export function createCli(): Command {
     .command('ls')
     .description('List saved host profiles (shortcut for `sshx host list`)')
     .option('--json', 'Output profiles in JSON format')
+    .option('--show-secrets', 'Include stored plaintext credentials in --json output')
     .option('-t, --tag <tag>', 'Filter by tag')
     .option('-s, --search <query>', 'Search by name, address, or tags')
     .action(async (options, command) => {
@@ -174,6 +175,7 @@ export function createCli(): Command {
     .command('hosts')
     .description('List saved host profiles (shortcut for `sshx host list`)')
     .option('--json', 'Output profiles in JSON format')
+    .option('--show-secrets', 'Include stored plaintext credentials in --json output')
     .option('-t, --tag <tag>', 'Filter by tag')
     .option('-s, --search <query>', 'Search by name, address, or tags')
     .action(async (options, command) => {
@@ -188,6 +190,7 @@ export function createCli(): Command {
     .alias('ls')
     .description('List saved host profiles')
     .option('--json', 'Output profiles in JSON format')
+    .option('--show-secrets', 'Include stored plaintext credentials in --json output')
     .option('-t, --tag <tag>', 'Filter by tag')
     .option('-s, --search <query>', 'Search by name, address, or tags')
     .action(async (options, command) => {
@@ -254,6 +257,7 @@ export function createCli(): Command {
     .alias('info')
     .description('Show detailed information about a host profile')
     .option('--json', 'Output details in JSON format')
+    .option('--show-secrets', 'Include stored plaintext credentials in --json output')
     .action(async (idOrName, options, command) => {
       await runHostShow(idOrName, command.optsWithGlobals());
     });
@@ -342,11 +346,12 @@ export function createCli(): Command {
 }
 
 // Direct execution (when run directly via node dist/cli/index.js or tsx src/cli/index.ts)
-const isDirectCli = process.argv[1] && (
-  process.argv[1].endsWith('/cli/index.ts') ||
-  process.argv[1].endsWith('/cli/index.js') ||
-  process.argv[1].endsWith('cli/index.js')
-);
+const normalizedArgv1 = process.argv[1]?.replace(/\\/g, '/');
+const isDirectCli = Boolean(normalizedArgv1 && (
+  normalizedArgv1.endsWith('/cli/index.ts') ||
+  normalizedArgv1.endsWith('/cli/index.js') ||
+  normalizedArgv1.endsWith('cli/index.js')
+));
 
 if (isDirectCli) {
   const program = createCli();

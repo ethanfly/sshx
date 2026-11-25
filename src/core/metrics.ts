@@ -77,6 +77,8 @@ export class MetricsCollector extends EventEmitter {
   private intervalMs: number;
   private timer?: NodeJS.Timeout;
   private isCollecting = false;
+  private consecutiveFailures = 0;
+  private ticksUntilRetry = 0;
   private lastSampleTime = 0;
   private lastCpuTotal = 0;
   private lastCpuIdle = 0;
@@ -85,16 +87,17 @@ export class MetricsCollector extends EventEmitter {
   private cachedMetrics?: ServerMetrics;
 
   // Multi-value lines use ';' between entries and '|' between fields.
-  private static COLLECTOR_SCRIPT = String.raw`
+  private static COLLECTOR_SCRIPT = wrapPosixSh(String.raw`
 U=$(whoami 2>/dev/null || echo "$USER")
 H=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "localhost")
-OS=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || uname -s)
+OS=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || sw_vers -productName 2>/dev/null || uname -s)
 UP=$(uptime 2>/dev/null | sed -e 's/.*up //' -e 's/,.*//')
 IP=$(hostname -I 2>/dev/null | awk '{print $1}' || ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || echo "")
-LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}' || uptime | sed 's/.*load average: //')
+LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}' || uptime 2>/dev/null | sed 's/.*load average[s]*: //')
 CPUM=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed -e 's/^[ \t]*//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "CPU")
 CPUC=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "1")
 CPUSTAT=$(grep '^cpu ' /proc/stat 2>/dev/null || echo "")
+CPUPCT=""
 CPUSOCK=$(awk 'FILENAME == "/proc/stat" { if ($1 ~ /^cpu[0-9]/) { c = substr($1, 4); p = (c in pkg) ? pkg[c] : 0; n[p]++; idle[p] += $5 + $6; for (i = 2; i <= NF; i++) tot[p] += $i } next } { split(FILENAME, a, "/"); pkg[substr(a[6], 4)] = $1 } END { for (p in tot) printf "%s|%d|%.0f|%.0f;", p, n[p], tot[p], idle[p] }' /sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id /proc/stat 2>/dev/null)
 
 if [ -f /proc/meminfo ]; then
@@ -102,14 +105,29 @@ if [ -f /proc/meminfo ]; then
   MA=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
   [ -z "$MA" ] && MA=$(awk '/MemFree/ {print int($2/1024)}' /proc/meminfo)
   MU=$((MT - MA))
+elif [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  TOTAL_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+  MT=$((TOTAL_BYTES / 1048576))
+  VM=$(vm_stat 2>/dev/null)
+  PS=$(printf '%s\n' "$VM" | awk '/page size of/ {for(i=1;i<=NF;i++) if($i~/^[0-9]+$/){print $i; exit}}')
+  [ -z "$PS" ] && PS=4096
+  MU=$(printf '%s\n' "$VM" | awk -v ps="$PS" '/Pages (active|wired down):/ {gsub(/\./, "", $NF); sum += $NF} END {printf "%.0f", (sum * ps) / 1048576}')
+  CPUPCT=$(top -l 1 -n 0 2>/dev/null | awk -F'[,%]' '/CPU usage:/ {for(i=1;i<=NF;i++) if($i ~ /idle/){gsub(/[^0-9.]/,"",$i); printf "%.1f", 100 - $i; exit}}')
+  [ -z "$IP" ] && IP=$(ipconfig getifaddr en0 2>/dev/null || ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" {print $2; exit}')
 else
   MT=0; MU=0
 fi
 
 DISKS=$(LC_ALL=C df -P -k 2>/dev/null | awk 'NR > 1 && $2 + 0 > 0 { d = $1; m = $6; for (i = 7; i <= NF; i++) m = m " " $i; if (d !~ /[\/:]/ || d ~ /^\/dev\/loop/ || (d in seen)) next; if (m ~ /^\/(boot|snap)(\/|$)/ || m ~ /^\/var\/lib\/(docker|kubelet|containers)\// || m ~ /^\/(System\/Volumes|private\/var\/vm)\//) next; seen[d] = 1; printf "%s|%.0f|%.0f|%.0f;", m, $2, $3, $4 }')
 
-NETIP=$(ip -o addr show 2>/dev/null | awk '{ n = $2; sub(/@.*/, "", n); split($4, a, "/"); if ($3 == "inet" && !(n in v4)) v4[n] = a[1]; else if ($3 == "inet6" && a[1] !~ /^fe80/ && !(n in v6)) v6[n] = a[1] } END { for (n in v4) printf "%s=%s ", n, v4[n]; for (n in v6) if (!(n in v4)) printf "%s=%s ", n, v6[n] }')
-NETS=$(awk -v ips="$NETIP" 'BEGIN { c = split(ips, arr, " "); for (i = 1; i <= c; i++) { split(arr[i], kv, "="); ip[kv[1]] = kv[2] } } NR > 2 { s = $0; sub(/^[ \t]+/, "", s); n = s; sub(/:.*/, "", n); sub(/^[^:]*:/, "", s); split(s, f, " "); if (n ~ /^(lo|veth|docker|br-|virbr|vnet|cni|flannel|cali|kube-|tunl|dummy|ifb|lxc|podman)/) next; st = "unknown"; fn = "/sys/class/net/" n "/operstate"; if ((getline v < fn) > 0) st = v; close(fn); printf "%s|%.0f|%.0f|%s|%s;", n, f[1], f[9], ip[n], st }' /proc/net/dev 2>/dev/null)
+if [ -r /proc/net/dev ]; then
+  NETIP=$(ip -o addr show 2>/dev/null | awk '{ n = $2; sub(/@.*/, "", n); split($4, a, "/"); if ($3 == "inet" && !(n in v4)) v4[n] = a[1]; else if ($3 == "inet6" && a[1] !~ /^fe80/ && !(n in v6)) v6[n] = a[1] } END { for (n in v4) printf "%s=%s ", n, v4[n]; for (n in v6) if (!(n in v4)) printf "%s=%s ", n, v6[n] }')
+  NETS=$(awk -v ips="$NETIP" 'BEGIN { c = split(ips, arr, " "); for (i = 1; i <= c; i++) { split(arr[i], kv, "="); ip[kv[1]] = kv[2] } } NR > 2 { s = $0; sub(/^[ \t]+/, "", s); n = s; sub(/:.*/, "", n); sub(/^[^:]*:/, "", s); split(s, f, " "); if (n ~ /^(lo|veth|docker|br-|virbr|vnet|cni|flannel|cali|kube-|tunl|dummy|ifb|lxc|podman)/) next; st = "unknown"; fn = "/sys/class/net/" n "/operstate"; if ((getline v < fn) > 0) st = v; close(fn); printf "%s|%.0f|%.0f|%s|%s;", n, f[1], f[9], ip[n], st }' /proc/net/dev 2>/dev/null)
+elif [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  NETS=$(netstat -ibn 2>/dev/null | awk 'NR > 1 && $1 !~ /^lo/ && $7 ~ /^[0-9]+$/ && $10 ~ /^[0-9]+$/ && !(seen[$1]++) { printf "%s|%.0f|%.0f||up;", $1, $7, $10 }')
+else
+  NETS=""
+fi
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   GPUS=$(nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | tr '\n' ';')
@@ -117,9 +135,9 @@ else
   GPUS=""
 fi
 
-printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTAT=%s\nCPUSOCK=%s\nMT=%s\nMU=%s\nDISKS=%s\nNETS=%s\nGPUS=%s\n" \
-  "$U" "$H" "$OS" "$UP" "$IP" "$LOAD" "$CPUM" "$CPUC" "$CPUSTAT" "$CPUSOCK" "$MT" "$MU" "$DISKS" "$NETS" "$GPUS"
-`.trim();
+printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTAT=%s\nCPUPCT=%s\nCPUSOCK=%s\nMT=%s\nMU=%s\nDISKS=%s\nNETS=%s\nGPUS=%s\n" \
+  "$U" "$H" "$OS" "$UP" "$IP" "$LOAD" "$CPUM" "$CPUC" "$CPUSTAT" "$CPUPCT" "$CPUSOCK" "$MT" "$MU" "$DISKS" "$NETS" "$GPUS"
+`.trim());
 
   constructor(client: Client, intervalMs = 2500) {
     super();
@@ -133,6 +151,8 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
 
   public start(): void {
     if (this.timer) return;
+    this.consecutiveFailures = 0;
+    this.ticksUntilRetry = 0;
     this.timer = setInterval(() => void this.poll(), this.intervalMs);
     void this.poll();
   }
@@ -147,6 +167,10 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
   private async poll(): Promise<void> {
     const timer = this.timer;
     if (!timer || this.isCollecting) return;
+    if (this.ticksUntilRetry > 0) {
+      this.ticksUntilRetry--;
+      return;
+    }
     this.isCollecting = true;
 
     try {
@@ -155,11 +179,19 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
       if (res.exitCode !== 0) {
         throw new Error(`Metrics probe exited with status ${res.exitCode}`);
       }
+      this.consecutiveFailures = 0;
+      this.ticksUntilRetry = 0;
       const metrics = this.parseOutput(res.stdout);
       this.cachedMetrics = metrics;
       this.emit('update', metrics);
     } catch (err) {
-      if (this.timer === timer && this.listenerCount('error') > 0) this.emit('error', err);
+      if (this.timer === timer) {
+        this.consecutiveFailures++;
+        if (this.consecutiveFailures >= 2) {
+          this.ticksUntilRetry = Math.min(15, (1 << Math.min(4, this.consecutiveFailures - 1)) - 1);
+        }
+        if (this.listenerCount('error') > 0) this.emit('error', err);
+      }
     } finally {
       this.isCollecting = false;
     }
@@ -182,6 +214,7 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
     // Parse CPU %
     let cpuUsagePercent = 0;
     const cpuStat = map.get('CPUSTAT') || '';
+    const cpuPct = map.get('CPUPCT') || '';
     if (cpuStat.startsWith('cpu')) {
       const parts = cpuStat.trim().split(/\s+/).slice(1).map(Number);
       if (parts.length >= 4) {
@@ -194,13 +227,15 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
           // Fallback to load average calculation
           const loadParts = (map.get('LOAD') || '').split(/\s+/).map(Number);
           const cores = Number(map.get('CPUC')) || 1;
-          if (loadParts[0] !== undefined) {
+          if (loadParts[0] !== undefined && Number.isFinite(loadParts[0])) {
             cpuUsagePercent = Math.min(100, Math.round((loadParts[0] / cores) * 1000) / 10);
           }
         }
         this.lastCpuTotal = total;
         this.lastCpuIdle = idle;
       }
+    } else if (cpuPct && Number.isFinite(Number(cpuPct))) {
+      cpuUsagePercent = Math.max(0, Math.min(100, Math.round(Number(cpuPct) * 10) / 10));
     }
 
     // Parse per-socket CPU: id|threads|total|idle
@@ -330,6 +365,10 @@ printf "USER=%s\nHOST=%s\nOS=%s\nUP=%s\nIP=%s\nLOAD=%s\nCPUM=%s\nCPUC=%s\nCPUSTA
       updatedAt: now
     };
   }
+}
+
+function wrapPosixSh(body: string): string {
+  return `sh -c '${body.replace(/'/g, `'\\''`)}'`;
 }
 
 function splitEntries(raw: string | undefined): string[][] {

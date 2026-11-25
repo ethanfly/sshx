@@ -11,6 +11,8 @@ import {
   KnownHostsManager,
   KeyManager,
   SSHConnection,
+  InteractiveSession,
+  resolveSshAgent,
   execCommand,
   expandProxyCommand,
   SFTPClient,
@@ -951,6 +953,241 @@ test('computeTableLayout: eliminates center gap and sizes columns proportionally
   const narrow = computeTableLayout(60, sampleHosts);
   assert.ok(narrow.totalWidth <= 60, `narrow totalWidth (${narrow.totalWidth}) should fit in 60 cols`);
   assert.equal(narrow.gap, 1);
+});
+
+test('ConfigManager: updateHost clears optional fields via null and getAppConfig is side-effect free', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-clear-fields-'));
+  const configDir = path.join(temporary, 'cfg');
+  try {
+    const manager = new ConfigManager(configDir);
+    const defaults = manager.getAppConfig();
+    assert.equal(defaults.sidebarDefault, 'auto');
+    assert.equal(defaults.sidebarHotkey, 'f2');
+    assert.equal(fs.existsSync(configDir), false);
+
+    const host = manager.addHost({
+      name: 'clearable',
+      host: '10.0.0.10',
+      authType: 'privateKey',
+      password: 'secret',
+      privateKeyPath: '~/.ssh/custom',
+      passphrase: 'keypw',
+      proxyJump: 'bastion',
+      proxyCommand: 'nc %h %p',
+      notes: 'initial note'
+    });
+
+    const cleared = manager.updateHost(host.id, {
+      password: null,
+      privateKeyPath: null,
+      proxyJump: null,
+      proxyCommand: null,
+      notes: null
+    });
+    assert.ok(cleared);
+    assert.equal(cleared.password, undefined);
+    assert.equal(cleared.privateKeyPath, undefined);
+    assert.equal(cleared.passphrase, undefined);
+    assert.equal(cleared.proxyJump, undefined);
+    assert.equal(cleared.proxyCommand, undefined);
+    assert.equal(cleared.notes, undefined);
+    assert.equal(cleared.host, '10.0.0.10');
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('OpenSSH config parser handles Match blocks, multi-alias, equals syntax, comments, Host *, and broken symlinks', () => {
+  const parsed = parseOpenSSHConfig(`
+Host web1 web2 *.web !excluded # production web
+  HostName="10.0.1.10" # inline comment
+  Port=2222
+  User = deploy
+  IdentityFile "~/.ssh/web_key"
+
+Match host *.internal exec "test -f /tmp/x"
+  User match-user
+  Port 9999
+  IdentityFile ~/.ssh/match_key
+
+Host db
+  HostName "10.0.2.20#tag"
+
+Host *
+  User fallback-user
+  Port 2200
+  ServerAliveInterval 30
+`);
+
+  assert.equal(parsed.length, 3);
+  assert.equal(parsed[0].name, 'web1');
+  assert.equal(parsed[0].host, '10.0.1.10');
+  assert.equal(parsed[0].port, 2222);
+  assert.equal(parsed[0].username, 'deploy');
+  assert.equal(parsed[0].privateKeyPath, '~/.ssh/web_key');
+  assert.equal(parsed[0].keepaliveInterval, 30000);
+
+  assert.equal(parsed[1].name, 'web2');
+  assert.equal(parsed[1].host, '10.0.1.10');
+  assert.equal(parsed[1].username, 'deploy');
+
+  assert.equal(parsed[2].name, 'db');
+  assert.equal(parsed[2].host, '10.0.2.20#tag');
+  assert.equal(parsed[2].username, 'fallback-user');
+  assert.equal(parsed[2].port, 2200);
+
+  // Include with multiple patterns, directory wildcards, and a broken symlink
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-openssh-include-'));
+  try {
+    const subA = path.join(temporary, 'conf.a');
+    const subB = path.join(temporary, 'conf.b');
+    fs.mkdirSync(subA);
+    fs.mkdirSync(subB);
+    fs.writeFileSync(path.join(subA, 'a.conf'), 'Host alpha\n  HostName 10.1.0.1\n');
+    fs.writeFileSync(path.join(subB, 'b.conf'), 'Host beta\n  HostName 10.1.0.2\n');
+    fs.symlinkSync(path.join(temporary, 'missing-target'), path.join(subA, 'broken.conf'));
+    const main = path.join(temporary, 'config');
+    fs.writeFileSync(main, 'Include conf.*/*.conf\n');
+
+    const included = parseOpenSSHConfigFile(main);
+    assert.deepEqual(included.map(h => h.name), ['alpha', 'beta']);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('KeyManager.listAvailableKeys scans configured dir without duplicates and ignores large non-key files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-keys-scan-'));
+  try {
+    const keyPath = path.join(dir, 'id_ed25519');
+    KeyManager.saveKeyPairToDisk(keyPath, { type: 'ed25519', comment: 'scan-test' });
+    fs.writeFileSync(path.join(dir, 'large_blob.bin'), Buffer.alloc(1024 * 1024, 0x41));
+
+    const found = KeyManager.listAvailableKeys([dir, dir]);
+    const matches = found.filter(k => k.path === keyPath);
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].type, 'ed25519');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SSHConnection: resolveSshAgent, multi-hop inline ProxyJump forwarding callbacks, and InteractiveSession env', async () => {
+  assert.equal(resolveSshAgent('linux', { SSH_AUTH_SOCK: '/tmp/agent.sock' }), '/tmp/agent.sock');
+  assert.equal(resolveSshAgent('win32', {}), '\\\\.\\pipe\\openssh-ssh-agent');
+  assert.equal(resolveSshAgent('linux', {}), undefined);
+
+  const banners: string[] = [];
+  const kbiPrompts: string[] = [];
+  const jumpServer = new ssh2.Server({ hostKeys: [mockServer.hostKeyPem], banner: 'Bastion Notice' }, client => {
+    client.on('error', () => {});
+    client.on('authentication', ctx => {
+      if (ctx.method !== 'keyboard-interactive') return ctx.reject(['keyboard-interactive']);
+      ctx.prompt([{ prompt: 'OTP: ', echo: false }], answers => {
+        if (answers[0] === '654321') ctx.accept();
+        else ctx.reject();
+      });
+    });
+    client.on('ready', () => {
+      client.on('tcpip', (accept, _reject, info) => {
+        const stream = accept();
+        const sock = net.connect(info.destPort, info.destIP, () => {
+          stream.pipe(sock).pipe(stream);
+        });
+        sock.on('error', () => stream.close());
+      });
+    });
+  });
+  await new Promise<void>(resolve => jumpServer.listen(0, '127.0.0.1', resolve));
+  const jumpPort = (jumpServer.address() as AddressInfo).port;
+
+  const conn = new SSHConnection({
+    profile: {
+      id: 'multi-hop-test',
+      name: 'multi-hop-test',
+      host: '127.0.0.1',
+      port: serverPort,
+      username: 'testuser',
+      authType: 'password',
+      password: 'testpass',
+      proxyJump: `testuser@127.0.0.1:${jumpPort}`
+    },
+    configManager,
+    knownHostsManager: testKnownHosts,
+    onBanner: msg => banners.push(msg),
+    onKeyboardInteractive: (_n, _i, _l, prompts, finish) => {
+      kbiPrompts.push(...prompts.map(p => p.prompt));
+      finish(['654321']);
+    }
+  });
+
+  try {
+    await conn.connect();
+    const res = await execCommand(conn.getRawClient(), 'echo hello');
+    assert.equal(res.stdout.trim(), 'hello');
+    assert.ok(banners.some(b => b.includes('Bastion Notice')));
+    assert.deepEqual(kbiPrompts, ['OTP: ']);
+  } finally {
+    conn.disconnect();
+    await new Promise<void>(resolve => jumpServer.close(() => resolve()));
+  }
+
+  let receivedShellArgs: unknown[] = [];
+  const envSession = new InteractiveSession({
+    shell(...args: unknown[]) {
+      receivedShellArgs = args.slice(0, -1);
+      const cb = args[args.length - 1] as (err: Error | undefined, ch: unknown) => void;
+      const ch = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), close() {} });
+      cb(undefined, ch);
+    }
+  } as any, { env: { MY_VAR: '123' } });
+  await envSession.start();
+  assert.equal(receivedShellArgs.length, 2);
+  assert.deepEqual(receivedShellArgs[1], { env: { MY_VAR: '123' } });
+  envSession.close();
+});
+
+test('TuiApp: search mode isolates hotkeys and runForm supports paste, emoji, secret cursor, and hints', async (context) => {
+  const input = Object.assign(new EventEmitter(), { isTTY: true, setRawMode() {}, resume() {} });
+  context.mock.getter(process, 'stdin', () => input as unknown as typeof process.stdin);
+  const app = new TuiApp() as any;
+  const writes: string[] = [];
+  context.mock.method(app.screen, 'flush', () => {
+    writes.push(app.screen.buffer.join(''));
+    app.screen.buffer = [];
+  });
+
+  // In normal mode, '/' enters search mode; typing 'd', 'e', 'v', 'a', 'j', 'k' updates filter without triggering modals
+  await app.handleInput('/', { name: '/' });
+  assert.equal(app.hostsScreen.searchMode, true);
+  for (const ch of ['d', 'e', 'v', 'a', 'j', 'k', 'S', '*']) {
+    await app.handleInput(ch, { name: ch });
+  }
+  assert.equal(app.hostsScreen.filterQuery, 'devajkS*');
+  assert.equal(app.inModal, false);
+
+  await app.handleInput(undefined, { name: 'escape' });
+  assert.equal(app.hostsScreen.searchMode, false);
+  assert.equal(app.hostsScreen.filterQuery, 'devajkS*');
+
+  const quitAfterClear = await app.handleInput(undefined, { name: 'escape' });
+  assert.equal(quitAfterClear, false);
+  assert.equal(app.hostsScreen.filterQuery, '');
+
+  // Test runForm paste, emoji, secret cursor left movement, and activeHint rendering
+  const fields = [
+    { key: 'name', label: 'name', value: '', hint: 'pick a friendly alias' },
+    { key: 'secret', label: 'secret', value: '', secret: true }
+  ];
+  const pending = app.editForm('Paste Test', fields);
+  assert.ok(writes.at(-1)?.includes('pick a friendly alias'));
+  input.emit('keypress', 'prod🔑', {});
+  input.emit('keypress', undefined, { name: 'tab' });
+  input.emit('keypress', 'abcd', {});
+  input.emit('keypress', undefined, { name: 'left' });
+  input.emit('keypress', 'X', {});
+  input.emit('keypress', '\x13', { name: 's', ctrl: true });
+  assert.deepEqual(await pending, { name: 'prod🔑', secret: 'abcXd' });
 });
 
 

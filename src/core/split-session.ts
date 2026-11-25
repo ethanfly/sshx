@@ -6,13 +6,14 @@ import { SidebarRenderer, defaultSidebarTheme } from '../tui/sidebar.js';
 export interface SplitSessionOptions extends SessionOptions {
   enableSidebar?: boolean;
   sidebarWidth?: number;
+  toggleHotkey?: 'f2' | 'f2+ctrl-o';
 }
 
 /**
  * Manages an interactive split-pane SSH session:
  * - Left pane: interactive remote PTY shell
  * - Right pane: live server resource monitor (IP, user, CPU, RAM, Disk, Net, GPU)
- * - Hotkeys: F2 or Ctrl+O to toggle sidebar expand/collapse
+ * - Hotkeys: F2 (or optionally Ctrl+O) to toggle sidebar expand/collapse
  */
 export class SplitSession {
   private session: InteractiveSession;
@@ -21,6 +22,7 @@ export class SplitSession {
 
   private sidebarVisible: boolean;
   private sidebarWidth: number;
+  private readonly toggleHotkey: 'f2' | 'f2+ctrl-o';
   private lastMetrics?: ServerMetrics;
   private metricsUnavailable = false;
   private attached = false;
@@ -29,6 +31,7 @@ export class SplitSession {
 
   constructor(client: Client, options: SplitSessionOptions = {}) {
     this.client = client;
+    this.toggleHotkey = options.toggleHotkey || 'f2';
 
     const totalCols = process.stdout.columns || 80;
     this.sidebarWidth = options.sidebarWidth || 34;
@@ -149,12 +152,14 @@ export class SplitSession {
       stdout.on('resize', onResize);
     }
 
-    // Stdin interceptor: listen for F2 or Ctrl+O to toggle sidebar
+    // Stdin interceptor: listen for F2 (and optionally Ctrl+O) to toggle sidebar
     const onStdinData = (chunk: Buffer) => {
       const str = chunk.toString('utf8');
 
-      // F2: \x1bOQ or \x1b[12~  |  Ctrl+O: \x0f
-      if (this.isInteractive() && (str === '\x1bOQ' || str === '\x1b[12~' || str === '\x0f')) {
+      // F2: \x1bOQ or \x1b[12~  |  Ctrl+O: \x0f (only when enabled)
+      const isF2 = str === '\x1bOQ' || str === '\x1b[12~';
+      const isCtrlO = this.toggleHotkey === 'f2+ctrl-o' && str === '\x0f';
+      if (this.isInteractive() && (isF2 || isCtrlO)) {
         this.toggleSidebar();
         return;
       }

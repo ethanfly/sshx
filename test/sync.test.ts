@@ -543,3 +543,42 @@ test('WebDAV push accepts an existing directory', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('SyncManager: falls back to SSHX_SYNC_PASSPHRASE when passphrase is not stored', async () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sshx-sync-env-pass-'));
+  const previous = process.env.SSHX_SYNC_PASSPHRASE;
+  try {
+    const config = new ConfigManager(temporary);
+    config.addHost({ name: 'env-host', host: '10.10.0.1' });
+    const sync = new SyncManager(config);
+    sync.saveConfig({
+      provider: 'webdav',
+      savePassphrase: false,
+      webdav: { url: 'https://mock.test', username: 'u', password: 'p' }
+    });
+
+    let stored = '';
+    sync.getProvider = () => ({
+      name: 'memory',
+      async test() { return { ok: true, message: 'ok' }; },
+      async pull() { return stored; },
+      async push(blob) { stored = blob; return {}; }
+    });
+
+    delete process.env.SSHX_SYNC_PASSPHRASE;
+    await assert.rejects(sync.push(), /Passphrase is required/);
+
+    process.env.SSHX_SYNC_PASSPHRASE = 'env-master-passphrase';
+    const pushed = await sync.push();
+    assert.equal(pushed.count, 1);
+
+    config.saveHosts([]);
+    const pulled = await sync.pull();
+    assert.equal(pulled.imported, 1);
+    assert.equal(config.getHost('env-host')?.host, '10.10.0.1');
+  } finally {
+    if (previous === undefined) delete process.env.SSHX_SYNC_PASSPHRASE;
+    else process.env.SSHX_SYNC_PASSPHRASE = previous;
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});

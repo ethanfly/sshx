@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const realScript = fs.realpathSync(__filename);
@@ -10,7 +10,7 @@ const distCli = path.join(packageRoot, 'dist', 'cli', 'index.js');
 
 let createCli;
 if (fs.existsSync(distCli)) {
-  const mod = await import(distCli);
+  const mod = await import(pathToFileURL(distCli).href);
   createCli = mod.createCli;
 } else {
   // If dist not built yet, fallback to tsx runner

@@ -93,6 +93,26 @@ export class MockSSHServer {
                 stream.exit(1);
               }
               stream.end();
+            } else if (cmd.includes('__SSHX_SECTION_OS__')) {
+              stream.write([
+                '__SSHX_SECTION_OS__',
+                'Linux',
+                '__SSHX_SECTION_UNAME__',
+                'Linux mock-sshx-test 6.0 #1 SMP',
+                '__SSHX_SECTION_UPTIME__',
+                'up 1 day',
+                '__SSHX_SECTION_MEM__',
+                'N/A',
+                '__SSHX_SECTION_DISK__',
+                '/ 100G 20G 80G 20%',
+                '__SSHX_SECTION_CPU__',
+                'Model name: Mock CPU',
+                '__SSHX_SECTION_HOST__',
+                'mock-sshx-test',
+                ''
+              ].join('\n'));
+              stream.exit(0);
+              stream.end();
             } else if (cmd === 'uname -a') {
               stream.write('Linux mock-sshx-test 6.0 #1 SMP\n');
               stream.exit(0);

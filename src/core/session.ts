@@ -15,6 +15,7 @@ export interface SessionOptions {
   cols?: number;
   term?: string;
   recordFilePath?: string;
+  env?: Record<string, string>;
 }
 
 /**
@@ -41,7 +42,8 @@ export class InteractiveSession extends EventEmitter {
       rows: options.rows || 24,
       cols: options.cols || 80,
       term: options.term || 'xterm-256color',
-      recordFilePath: options.recordFilePath
+      recordFilePath: options.recordFilePath,
+      env: options.env
     };
   }
 
@@ -75,50 +77,53 @@ export class InteractiveSession extends EventEmitter {
       this.cancelStarting = cancel;
 
       try {
-        this.client.shell(
-          {
-            term: this.options.term,
-            rows: this.options.rows,
-            cols: this.options.cols
-          },
-          (err: Error | undefined, stream: ClientChannel) => {
-            if (settled) {
-              if (stream) this.closeStream(stream);
-              return;
-            }
-            settled = true;
-            clearCancellation();
-            if (err) return reject(err);
-
-            try {
-              this.openRecording();
-            } catch (error) {
-              this.closeStream(stream);
-              reject(error);
-              return;
-            }
-            this.stream = stream;
-            this.isActive = true;
-
-            const onStdout = (data: Buffer) => this.forwardOutput(data, stream);
-            const onStderr = (data: Buffer) => this.forwardOutput(data, stream.stderr);
-            const onClose = () => this.finish();
-            const onError = (streamErr: Error) => this.fail(streamErr);
-            stream.on('data', onStdout);
-            stream.stderr.on('data', onStderr);
-            stream.once('close', onClose);
-            stream.on('error', onError);
-            this.detachStream = () => {
-              stream.removeListener('data', onStdout);
-              stream.stderr.removeListener('data', onStderr);
-              stream.removeListener('close', onClose);
-              stream.removeListener('error', onError);
-              this.detachStream = undefined;
-            };
-
-            resolve(stream);
+        const windowOpts = {
+          term: this.options.term,
+          rows: this.options.rows,
+          cols: this.options.cols
+        };
+        const onShell = (err: Error | undefined, stream: ClientChannel) => {
+          if (settled) {
+            if (stream) this.closeStream(stream);
+            return;
           }
-        );
+          settled = true;
+          clearCancellation();
+          if (err) return reject(err);
+
+          try {
+            this.openRecording();
+          } catch (error) {
+            this.closeStream(stream);
+            reject(error);
+            return;
+          }
+          this.stream = stream;
+          this.isActive = true;
+
+          const onStdout = (data: Buffer) => this.forwardOutput(data, stream);
+          const onStderr = (data: Buffer) => this.forwardOutput(data, stream.stderr);
+          const onClose = () => this.finish();
+          const onError = (streamErr: Error) => this.fail(streamErr);
+          stream.on('data', onStdout);
+          stream.stderr.on('data', onStderr);
+          stream.once('close', onClose);
+          stream.on('error', onError);
+          this.detachStream = () => {
+            stream.removeListener('data', onStdout);
+            stream.stderr.removeListener('data', onStderr);
+            stream.removeListener('close', onClose);
+            stream.removeListener('error', onError);
+            this.detachStream = undefined;
+          };
+
+          resolve(stream);
+        };
+        if (this.options.env && Object.keys(this.options.env).length > 0) {
+          this.client.shell(windowOpts, { env: this.options.env }, onShell);
+        } else {
+          this.client.shell(windowOpts, onShell);
+        }
       } catch (error) {
         settled = true;
         clearCancellation();

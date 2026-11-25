@@ -4,7 +4,7 @@ import { HostsScreen, HostSortMode } from './screens/hosts.js';
 import { runForm, FormField } from './form.js';
 import { resolveTheme, TuiTheme } from './theme.js';
 import { runConnect } from '../cli/connect.js';
-import { defaultConfigManager, HostProfile } from '../core/config.js';
+import { defaultConfigManager, HostProfile, HostProfileUpdate } from '../core/config.js';
 import { defaultSyncManager } from '../sync/manager.js';
 import { colors } from '../cli/utils.js';
 import { errorMessage } from '../core/errors.js';
@@ -24,7 +24,8 @@ export class TuiApp {
 
   constructor(options: TuiOptions = {}) {
     this.screen = new ScreenBuffer();
-    this.theme = resolveTheme(options.color);
+    const appConfig = defaultConfigManager.getAppConfig();
+    this.theme = resolveTheme(options.color ?? appConfig.theme);
     this.hostsScreen = new HostsScreen({ search: options.search, sort: options.sort });
   }
 
@@ -96,6 +97,54 @@ export class TuiApp {
 
   private async handleInput(str: string | undefined, key: readline.Key): Promise<boolean> {
     if (key?.ctrl && key.name === 'c') return true;
+
+    if (this.hostsScreen.searchMode) {
+      if (key?.name === 'escape') {
+        this.hostsScreen.searchMode = false;
+        return false;
+      }
+      if (key?.ctrl && key.name === 'u') {
+        this.hostsScreen.clearFilter();
+        return false;
+      }
+      if (key?.name === 'up' || (key?.ctrl && key.name === 'p') || (key?.ctrl && key.name === 'k')) {
+        this.hostsScreen.move(-1, this.visibleRows());
+        return false;
+      }
+      if (key?.name === 'down' || (key?.ctrl && key.name === 'n') || (key?.ctrl && key.name === 'j')) {
+        this.hostsScreen.move(1, this.visibleRows());
+        return false;
+      }
+      if (key?.name === 'pageup') {
+        this.hostsScreen.move(-this.visibleRows(), this.visibleRows());
+        return false;
+      }
+      if (key?.name === 'pagedown') {
+        this.hostsScreen.move(this.visibleRows(), this.visibleRows());
+        return false;
+      }
+      if (key?.name === 'home') {
+        this.hostsScreen.jump(0, this.visibleRows());
+        return false;
+      }
+      if (key?.name === 'end') {
+        this.hostsScreen.jump(this.hostsScreen.getFilteredHosts().length - 1, this.visibleRows());
+        return false;
+      }
+      if (key?.name === 'backspace') {
+        this.hostsScreen.backspaceFilter();
+        return false;
+      }
+      if (key?.name === 'return') {
+        await this.connectSelected();
+        return false;
+      }
+      if (str && str.length > 0 && !key?.ctrl && !key?.meta) {
+        this.hostsScreen.appendFilter(str);
+      }
+      return false;
+    }
+
     if (key?.name === 'escape') {
       if (this.hostsScreen.filterQuery) {
         this.hostsScreen.clearFilter();
@@ -136,6 +185,10 @@ export class TuiApp {
       this.hostsScreen.backspaceFilter();
       return false;
     }
+    if (str === '/') {
+      this.hostsScreen.searchMode = true;
+      return false;
+    }
     if (str === 'a') {
       await this.addHost();
       return false;
@@ -168,9 +221,6 @@ export class TuiApp {
     if (key?.name === 'return') {
       await this.connectSelected();
       return false;
-    }
-    if (str && str.length === 1 && !key?.ctrl && !key?.meta && str >= ' ' && str !== '\x1b') {
-      this.hostsScreen.appendFilter(str);
     }
     return false;
   }
@@ -211,14 +261,14 @@ export class TuiApp {
     }
     const values = await this.editForm(`Edit ${current.name}`, hostToFields(current));
     if (!values) return;
-    const profile = valuesToProfile(values);
-    if (!profile) {
+    const updates = valuesToUpdate(values);
+    if (!updates) {
       this.hostsScreen.statusMessage = 'name, host and username are required';
       return;
     }
-    defaultConfigManager.updateHost(current.id, profile);
+    defaultConfigManager.updateHost(current.id, updates);
     this.hostsScreen.refreshHosts();
-    this.hostsScreen.statusMessage = `updated ${profile.name}`;
+    this.hostsScreen.statusMessage = `updated ${updates.name}`;
   }
 
   private async editForm(
@@ -284,13 +334,33 @@ export class TuiApp {
       return;
     }
 
-    this.hostsScreen.statusMessage = `syncing with ${config.provider}...`;
+    const needsPassphrase = !config.passphrase && !process.env.SSHX_SYNC_PASSPHRASE;
+    const fields: FormField[] = [
+      { key: 'action', label: 'action', value: 'pull', hint: 'pull (merge) | push | overwrite' },
+      ...(needsPassphrase ? [{ key: 'passphrase', label: 'passphrase', value: '', secret: true }] : [])
+    ];
+    const values = await this.editForm(`Cloud Sync (${config.provider})`, fields, 'ctrl-s run   esc cancel');
+    if (!values) return;
+
+    const action = values.action.trim().toLowerCase() || 'pull';
+    if (action !== 'pull' && action !== 'push' && action !== 'overwrite') {
+      this.hostsScreen.statusMessage = 'invalid sync action: use pull, push, or overwrite';
+      return;
+    }
+    const pass = values.passphrase || undefined;
+
+    this.hostsScreen.statusMessage = `syncing (${action}) with ${config.provider}...`;
     this.render();
 
     try {
-      const res = await defaultSyncManager.pull();
-      this.hostsScreen.refreshHosts();
-      this.hostsScreen.statusMessage = `synced ${res.total} hosts (${res.imported} new, ${res.updated} updated)`;
+      if (action === 'push') {
+        const res = await defaultSyncManager.push(pass);
+        this.hostsScreen.statusMessage = `pushed ${res.count} hosts to ${config.provider}`;
+      } else {
+        const res = await defaultSyncManager.pull(pass, action === 'overwrite' ? 'overwrite' : 'merge');
+        this.hostsScreen.refreshHosts();
+        this.hostsScreen.statusMessage = `synced ${res.total} hosts (${res.imported} new, ${res.updated} updated)`;
+      }
     } catch (err) {
       this.hostsScreen.statusMessage = `sync failed: ${errorMessage(err)}`;
     }
@@ -324,16 +394,18 @@ export class TuiApp {
 }
 
 function blankHost(): FormField[] {
+  const appConfig = defaultConfigManager.getAppConfig();
   return [
     { key: 'name', label: 'name', value: '' },
     { key: 'host', label: 'host', value: '' },
-    { key: 'port', label: 'port', value: '22' },
-    { key: 'username', label: 'username', value: 'root' },
+    { key: 'port', label: 'port', value: String(appConfig.defaultPort || 22) },
+    { key: 'username', label: 'username', value: appConfig.defaultUsername || 'root' },
     { key: 'authType', label: 'auth', value: 'key', hint: 'key | password | agent' },
-    { key: 'privateKeyPath', label: 'key path', value: '~/.ssh/id_ed25519' },
+    { key: 'privateKeyPath', label: 'key path', value: appConfig.defaultKeyPath || '~/.ssh/id_ed25519' },
     { key: 'password', label: 'password', value: '', secret: true },
     { key: 'passphrase', label: 'key passphrase', value: '', secret: true },
     { key: 'proxyJump', label: 'jump host', value: '' },
+    { key: 'proxyCommand', label: 'proxy cmd', value: '' },
     { key: 'tags', label: 'tags', value: '', hint: 'comma separated' },
     { key: 'notes', label: 'notes', value: '' }
   ];
@@ -346,14 +418,24 @@ function hostToFields(host: HostProfile): FormField[] {
     { key: 'host', label: 'host', value: host.host },
     { key: 'port', label: 'port', value: String(host.port || 22) },
     { key: 'username', label: 'username', value: host.username },
-    { key: 'authType', label: 'auth', value: auth },
+    { key: 'authType', label: 'auth', value: auth, hint: 'key | password | agent' },
     { key: 'privateKeyPath', label: 'key path', value: host.privateKeyPath || '' },
     { key: 'password', label: 'password', value: host.password || '', secret: true },
     { key: 'passphrase', label: 'key passphrase', value: host.passphrase || '', secret: true },
     { key: 'proxyJump', label: 'jump host', value: host.proxyJump || '' },
-    { key: 'tags', label: 'tags', value: (host.tags || []).join(',') },
+    { key: 'proxyCommand', label: 'proxy cmd', value: host.proxyCommand || '' },
+    { key: 'tags', label: 'tags', value: (host.tags || []).join(','), hint: 'comma separated' },
     { key: 'notes', label: 'notes', value: host.notes || '' }
   ];
+}
+
+function parseFormAuth(values: Record<string, string>): HostProfile['authType'] {
+  const authRaw = values.authType.trim().toLowerCase();
+  return authRaw === 'password' || authRaw === '2'
+    ? 'password'
+    : authRaw === 'agent'
+      ? 'agent'
+      : 'privateKey';
 }
 
 function valuesToProfile(values: Record<string, string>): Omit<HostProfile, 'id'> | null {
@@ -362,11 +444,7 @@ function valuesToProfile(values: Record<string, string>): Omit<HostProfile, 'id'
   const username = values.username.trim();
   if (!name || !host || !username) return null;
 
-  const authRaw = values.authType.trim().toLowerCase();
-  const authType: HostProfile['authType'] =
-    authRaw === 'password' || authRaw === '2' ? 'password' :
-    authRaw === 'agent' ? 'agent' : 'privateKey';
-
+  const authType = parseFormAuth(values);
   const tags = values.tags.split(',').map(t => t.trim()).filter(Boolean);
   const port = parseInt(values.port, 10) || 22;
 
@@ -380,7 +458,34 @@ function valuesToProfile(values: Record<string, string>): Omit<HostProfile, 'id'
     privateKeyPath: authType === 'privateKey' ? (values.privateKeyPath.trim() || undefined) : undefined,
     passphrase: values.passphrase || undefined,
     proxyJump: values.proxyJump.trim() || undefined,
+    proxyCommand: values.proxyCommand?.trim() || undefined,
     tags,
     notes: values.notes.trim() || undefined
+  };
+}
+
+function valuesToUpdate(values: Record<string, string>): HostProfileUpdate | null {
+  const name = values.name.trim();
+  const host = values.host.trim();
+  const username = values.username.trim();
+  if (!name || !host || !username) return null;
+
+  const authType = parseFormAuth(values);
+  const tags = values.tags.split(',').map(t => t.trim()).filter(Boolean);
+  const port = parseInt(values.port, 10) || 22;
+
+  return {
+    name,
+    host,
+    port,
+    username,
+    authType,
+    password: values.password || null,
+    privateKeyPath: authType === 'privateKey' ? (values.privateKeyPath.trim() || null) : null,
+    passphrase: values.passphrase || null,
+    proxyJump: values.proxyJump.trim() || null,
+    proxyCommand: values.proxyCommand?.trim() || null,
+    tags,
+    notes: values.notes.trim() || null
   };
 }

@@ -531,3 +531,38 @@ test('Tunnel CLI releases its listener on SSH connection close', { timeout: 8000
   context.after(() => { rebind.close(); });
   await listening;
 });
+
+test('Tunnel: parses IPv6 bracketed forwarding specs and rejects malformed brackets', () => {
+  const localV6 = parsePortForwardString('[::1]:8080:[2001:db8::1]:80', 'local');
+  assert.equal(localV6.localHost, '::1');
+  assert.equal(localV6.localPort, 8080);
+  assert.equal(localV6.remoteHost, '2001:db8::1');
+  assert.equal(localV6.remotePort, 80);
+
+  const remoteV6 = parsePortForwardString('9000:[::1]:3000', 'remote');
+  assert.equal(remoteV6.remoteHost, '127.0.0.1');
+  assert.equal(remoteV6.remotePort, 9000);
+  assert.equal(remoteV6.localHost, '::1');
+  assert.equal(remoteV6.localPort, 3000);
+
+  const dynamicV6 = parsePortForwardString('[::1]:1080', 'dynamic');
+  assert.equal(dynamicV6.localHost, '::1');
+  assert.equal(dynamicV6.localPort, 1080);
+
+  for (const invalid of ['[::1', '[not-ipv6]:8080:localhost:80', '[::1]junk:1080', '8080:[::1]:']) {
+    assert.throws(() => parsePortForwardString(invalid, 'local'), /Invalid port forwarding specification/);
+  }
+});
+
+test('Tunnel: stop completes on close even if unforwardIn never calls back', async () => {
+  const client = Object.assign(new EventEmitter(), {
+    forwardIn(_host: string, _port: number, callback: () => void) { callback(); },
+    unforwardIn() { /* intentionally hangs */ }
+  });
+  const tunnel = await new TunnelManager(client as unknown as Client).addTunnel(parsePortForwardString('12555:localhost:12556', 'remote'));
+  await tunnel.start();
+  const stopping = tunnel.stop();
+  client.emit('close');
+  await stopping;
+  assert.equal(tunnel.getStats().status, 'stopped');
+});

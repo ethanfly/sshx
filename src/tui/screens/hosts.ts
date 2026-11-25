@@ -10,6 +10,7 @@ export class HostsScreen {
   public selectedIndex: number = 0;
   public scrollOffset: number = 0;
   public filterQuery: string = '';
+  public searchMode: boolean = false;
   public statusMessage: string = '';
   public sortMode: HostSortMode = 'name';
   private hosts: HostProfile[] = [];
@@ -17,6 +18,7 @@ export class HostsScreen {
 
   constructor(options: { search?: string; sort?: HostSortMode } = {}) {
     this.filterQuery = options.search || '';
+    this.searchMode = Boolean(options.search);
     this.sortMode = options.sort || 'name';
     this.refreshHosts();
   }
@@ -44,6 +46,7 @@ export class HostsScreen {
         h.host,
         h.username,
         String(h.port),
+        h.group || '',
         h.notes || '',
         ...(h.tags || [])
       ].join(' ').toLowerCase();
@@ -90,19 +93,24 @@ export class HostsScreen {
   }
 
   public appendFilter(ch: string): void {
-    this.filterQuery += ch;
+    const clean = ch.replace(/[\x00-\x1f\x7f]/g, '');
+    if (!clean) return;
+    this.filterQuery += clean;
     this.selectedIndex = 0;
     this.scrollOffset = 0;
   }
 
   public backspaceFilter(): void {
-    this.filterQuery = this.filterQuery.slice(0, -1);
+    const chars = Array.from(this.filterQuery);
+    chars.pop();
+    this.filterQuery = chars.join('');
     this.selectedIndex = 0;
     this.scrollOffset = 0;
   }
 
   public clearFilter(): void {
     this.filterQuery = '';
+    this.searchMode = false;
     this.selectedIndex = 0;
     this.scrollOffset = 0;
   }
@@ -116,9 +124,11 @@ export class HostsScreen {
     this.ensureVisible(visibleRows);
 
     const query = this.filterQuery;
-    const searchLabel = query.length > 0
+    const searchLabel = this.searchMode
       ? `${theme.accent}search:${colors.reset} ${query}${theme.accent}▍${colors.reset}`
-      : `${theme.muted}type to search · space = AND${colors.reset}`;
+      : query.length > 0
+        ? `${theme.accent}filter:${colors.reset} ${query} ${theme.muted}(/ edit · esc clear)${colors.reset}`
+        : `${theme.muted}press / to search${colors.reset}`;
     screen.writeAt(2, 1, `${theme.title}sshx${colors.reset} ${theme.muted}hosts${colors.reset}  ${searchLabel}`);
 
     const count = `${list.length}/${this.hosts.length}`;
@@ -189,9 +199,12 @@ export class HostsScreen {
       });
     }
 
+    const defaultFooter = this.searchMode
+      ? 'type to filter · space = AND   ↑↓ move   enter connect   esc done'
+      : '↑↓/jk move  / search  enter connect  a add  e edit  d del  t ping  S sync  i import  esc quit';
     const statusText = this.statusMessage
       ? this.statusMessage
-      : '↑↓/jk move  enter connect  a add  e edit  d delete  t ping  S sync  i import  esc quit';
+      : defaultFooter;
     const statusColor = this.statusMessage ? theme.warn : theme.muted;
     const footerWidth = Math.max(10, screen.cols - 2);
     screen.writeAt(2, footerRow, `${statusColor}${padClip(statusText, footerWidth)}${colors.reset}`);

@@ -117,3 +117,18 @@ test('explicit identity and password do not reuse other saved authentication fie
   assert.equal(password.privateKeyPath, undefined);
   assert.equal(password.privateKey, undefined);
 });
+
+test('direct targets honor AppConfig defaultPort, defaultUsername, and defaultKeyPath', () => {
+  defaultConfigManager.saveAppConfig({
+    defaultPort: 2222,
+    defaultUsername: 'deploy',
+    defaultKeyPath: path.join(temporary, 'custom_ed25519')
+  });
+  fs.writeFileSync(path.join(temporary, 'custom_ed25519'), 'dummy-key');
+
+  const resolved = resolveTarget('app.example.test');
+  assert.equal(resolved.port, 2222);
+  assert.equal(resolved.username, 'deploy');
+  assert.equal(resolved.authType, 'privateKey');
+  assert.equal(resolved.privateKeyPath, path.join(temporary, 'custom_ed25519'));
+});

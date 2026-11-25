@@ -42,14 +42,50 @@ const appConfigSchema = z.object({
   defaultUsername: z.string(),
   defaultKeyPath: z.string().optional(),
   strictHostKeyChecking: z.enum(['yes', 'no', 'accept-new']),
-  theme: z.enum(['dark', 'light', 'dracula', 'nord', 'catppuccin']),
+  theme: z.enum(['default', 'dark', 'light', 'dracula', 'nord', 'catppuccin']),
   terminalFontSize: z.number().positive(),
   terminalFontFamily: z.string(),
-  recentHostsLimit: z.number().int().nonnegative()
+  recentHostsLimit: z.number().int().nonnegative(),
+  sidebarDefault: z.enum(['auto', 'always', 'never']).default('auto'),
+  sidebarHotkey: z.enum(['f2', 'f2+ctrl-o']).default('f2')
 });
 
 export type HostProfile = z.infer<typeof hostProfileSchema>;
 type HostInput = z.infer<typeof importedHostSchema>;
+
+export type ClearableHostField =
+  | 'password'
+  | 'privateKeyPath'
+  | 'privateKey'
+  | 'passphrase'
+  | 'proxyJump'
+  | 'proxyCommand'
+  | 'notes'
+  | 'group'
+  | 'environment'
+  | 'keepaliveInterval'
+  | 'keepaliveCountMax'
+  | 'readyTimeout';
+
+export type HostProfileUpdate = {
+  [K in keyof HostProfile]?: K extends ClearableHostField ? HostProfile[K] | null : HostProfile[K];
+};
+
+export type RedactedHostProfile = Omit<HostProfile, 'password' | 'passphrase' | 'privateKey'> & {
+  hasPassword?: boolean;
+  hasPassphrase?: boolean;
+  hasPrivateKey?: boolean;
+};
+
+export function redactHostSecrets(profile: HostProfile): RedactedHostProfile {
+  const { password, passphrase, privateKey, ...rest } = profile;
+  return {
+    ...rest,
+    ...(password ? { hasPassword: true } : {}),
+    ...(passphrase ? { hasPassphrase: true } : {}),
+    ...(privateKey ? { hasPrivateKey: true } : {})
+  };
+}
 
 export class DuplicateHostError extends Error {
   constructor(name: string) {
@@ -77,11 +113,27 @@ function requireUniqueHosts(hosts: HostProfile[]): void {
 
 const endpointCredentials = ['password', 'privateKeyPath', 'privateKey', 'passphrase', 'proxyJump', 'proxyCommand'] as const;
 
-function mergeHostProfile(profile: HostInput, existing?: HostProfile): HostProfile {
-  const endpointChanged = existing && (profile.host !== existing.host ||
-    (profile.port ?? existing.port) !== existing.port || (profile.username ?? existing.username) !== existing.username);
-  const provided: HostInput = { ...profile };
+function mergeHostProfile(profile: HostInput | HostProfileUpdate, existing?: HostProfile): HostProfile {
+  const cleared = new Set<string>();
+  const providedEntries: Array<[string, unknown]> = [];
+  for (const [key, value] of Object.entries(profile)) {
+    if (value === null) {
+      cleared.add(key);
+    } else if (value !== undefined) {
+      providedEntries.push([key, value]);
+    }
+  }
+  const provided: HostInput = Object.fromEntries(providedEntries) as HostInput;
+
+  const endpointChanged = existing && (
+    (provided.host !== undefined && provided.host !== existing.host) ||
+    (provided.port !== undefined && provided.port !== existing.port) ||
+    (provided.username !== undefined && provided.username !== existing.username)
+  );
   const inherited: Partial<HostProfile> = { ...existing };
+  for (const key of cleared) {
+    delete inherited[key as keyof HostProfile];
+  }
   if (endpointChanged && existing) {
     inherited.authType = undefined;
     if (provided.authType === existing.authType) delete provided.authType;
@@ -94,11 +146,12 @@ function mergeHostProfile(profile: HostInput, existing?: HostProfile): HostProfi
     }
   }
   if (existing && !endpointChanged) {
-    const newPath = profile.privateKeyPath;
+    const newPath = provided.privateKeyPath;
     const oldPath = existing.privateKeyPath;
-    const pathChanged = newPath !== undefined && toPortablePath(newPath) !== toPortablePath(oldPath ?? '');
-    if (pathChanged && profile.privateKey === undefined) inherited.privateKey = undefined;
-    const inlineKey = profile.privateKey ?? inherited.privateKey;
+    const pathCleared = cleared.has('privateKeyPath');
+    const pathChanged = pathCleared || (newPath !== undefined && toPortablePath(newPath) !== toPortablePath(oldPath ?? ''));
+    if (pathChanged && provided.privateKey === undefined) inherited.privateKey = undefined;
+    const inlineKey = provided.privateKey ?? inherited.privateKey;
     if (inlineKey !== existing.privateKey || (pathChanged && !inlineKey)) inherited.passphrase = undefined;
   }
   const normalized = hostProfileSchema.parse({
@@ -106,8 +159,8 @@ function mergeHostProfile(profile: HostInput, existing?: HostProfile): HostProfi
     username: 'root',
     tags: [],
     ...inherited,
-    ...Object.fromEntries(Object.entries(provided).filter(([, value]) => value !== undefined)),
-    id: existing?.id ?? profile.id ?? `host_${randomUUID()}`,
+    ...provided,
+    id: existing?.id ?? provided.id ?? `host_${randomUUID()}`,
     authType: provided.authType ?? inherited.authType ?? (provided.privateKeyPath || provided.privateKey ? 'privateKey' : 'password')
   });
   if (normalized.privateKeyPath) {
@@ -121,10 +174,12 @@ export interface AppConfig {
   defaultUsername: string;
   defaultKeyPath?: string;
   strictHostKeyChecking: 'yes' | 'no' | 'accept-new';
-  theme: 'dark' | 'light' | 'dracula' | 'nord' | 'catppuccin';
+  theme: 'default' | 'dark' | 'light' | 'dracula' | 'nord' | 'catppuccin';
   terminalFontSize: number;
   terminalFontFamily: string;
   recentHostsLimit: number;
+  sidebarDefault: 'auto' | 'always' | 'never';
+  sidebarHotkey: 'f2' | 'f2+ctrl-o';
 }
 
 export class ConfigManager {
@@ -183,7 +238,9 @@ export class ConfigManager {
       theme: 'dracula',
       terminalFontSize: 14,
       terminalFontFamily: 'Consolas, Menlo, Monaco, "Courier New", monospace',
-      recentHostsLimit: 20
+      recentHostsLimit: 20,
+      sidebarDefault: 'auto',
+      sidebarHotkey: 'f2'
     };
   }
 
@@ -195,9 +252,7 @@ export class ConfigManager {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw new Error(`Could not read app configuration '${this.configFilePath}': ${(error as Error).message}`);
       }
-      const defaults = this.getDefaultAppConfig();
-      this.saveAppConfig(defaults);
-      return defaults;
+      return this.getDefaultAppConfig();
     }
 
     let parsed: unknown;
@@ -307,6 +362,7 @@ export class ConfigManager {
         h.host.toLowerCase().includes(q) ||
         h.username.toLowerCase().includes(q) ||
         h.id.toLowerCase().includes(q) ||
+        (h.group && h.group.toLowerCase().includes(q)) ||
         (h.notes && h.notes.toLowerCase().includes(q)) ||
         (h.tags && h.tags.some(t => t.toLowerCase().includes(q)))
       );
@@ -371,7 +427,7 @@ export class ConfigManager {
     return newHost;
   }
 
-  public updateHost(idOrName: string, updates: Partial<HostProfile>): HostProfile | null {
+  public updateHost(idOrName: string, updates: HostProfileUpdate): HostProfile | null {
     const hosts = this.getHosts();
     const byId = hosts.findIndex(host => host.id === idOrName);
     const index = byId >= 0 ? byId : hosts.findIndex(host => hostNameKey(host.name) === hostNameKey(idOrName));

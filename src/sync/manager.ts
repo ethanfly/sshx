@@ -120,7 +120,7 @@ export class SyncManager {
       throw new Error('Sync is not configured. Run "sshx sync setup" to get started.');
     }
 
-    const resolvedPassphrase = passphrase || config.passphrase;
+    const resolvedPassphrase = passphrase || config.passphrase || process.env.SSHX_SYNC_PASSPHRASE;
     if (!resolvedPassphrase) {
       throw new Error('Passphrase is required to encrypt your host profiles.');
     }
@@ -158,7 +158,7 @@ export class SyncManager {
       throw new Error('Sync is not configured. Run "sshx sync setup" to get started.');
     }
 
-    const resolvedPassphrase = passphrase || config.passphrase;
+    const resolvedPassphrase = passphrase || config.passphrase || process.env.SSHX_SYNC_PASSPHRASE;
     if (!resolvedPassphrase) {
       throw new Error('Passphrase is required to decrypt your host profiles.');
     }

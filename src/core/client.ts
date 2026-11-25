@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
 import { Duplex } from 'node:stream';
@@ -33,6 +34,7 @@ export class SSHConnection {
   private profile: HostProfile;
   private configManager: ConfigManager;
   private knownHostsManager: KnownHostsManager;
+  private readonly onBanner?: (message: string) => void;
   private readonly onKeyboardInteractive?: KeyboardInteractiveHandler;
   private isConnected: boolean = false;
   private jumpConnection?: SSHConnection;
@@ -52,6 +54,7 @@ export class SSHConnection {
     this.configManager = options.configManager || defaultConfigManager;
     this.knownHostsManager = options.knownHostsManager || new KnownHostsManager();
     this.jumpAncestors = jumpAncestors;
+    this.onBanner = options.onBanner;
     this.onKeyboardInteractive = options.onKeyboardInteractive;
     this.client.on('close', () => { this.socketsClosed++; });
     this.registerAuthListeners(options.onBanner);
@@ -114,29 +117,39 @@ export class SSHConnection {
   private async openConnection(): Promise<void> {
     let transportSocket: ConnectConfig['sock'];
 
-    // 1. Handle Jump Host / ProxyJump
+    // 1. Handle Jump Host / ProxyJump (supports comma-separated multi-hop and inline [user@]host[:port])
     if (this.profile.proxyJump) {
-      const jumpProfile = this.configManager.getHost(this.profile.proxyJump);
-      if (!jumpProfile) {
-        throw new Error(`Jump host profile not found: "${this.profile.proxyJump}"`);
-      }
-      if (jumpProfile.id === this.profile.id || this.jumpAncestors.has(jumpProfile.id)) {
-        throw new Error(`ProxyJump cycle detected for host "${jumpProfile.name}".`);
-      }
-      this.jumpConnection = new SSHConnection({
-        profile: jumpProfile,
-        configManager: this.configManager,
-        knownHostsManager: this.knownHostsManager
-      }, new Set([...this.jumpAncestors, this.profile.id]));
-      await this.jumpConnection.connect();
+      const hops = this.profile.proxyJump.split(',').map(hop => hop.trim()).filter(Boolean);
+      if (hops.length > 0) {
+        const nextSpec = hops[hops.length - 1];
+        const remainingHops = hops.slice(0, -1).join(',');
+        let jumpProfile = this.resolveJumpProfile(nextSpec);
+        if (jumpProfile.id === this.profile.id || this.jumpAncestors.has(jumpProfile.id)) {
+          throw new Error(`ProxyJump cycle detected for host "${jumpProfile.name}".`);
+        }
+        if (remainingHops) {
+          jumpProfile = {
+            ...jumpProfile,
+            proxyJump: jumpProfile.proxyJump ? `${remainingHops},${jumpProfile.proxyJump}` : remainingHops
+          };
+        }
+        this.jumpConnection = new SSHConnection({
+          profile: jumpProfile,
+          configManager: this.configManager,
+          knownHostsManager: this.knownHostsManager,
+          onBanner: this.onBanner,
+          onKeyboardInteractive: this.onKeyboardInteractive
+        }, new Set([...this.jumpAncestors, this.profile.id]));
+        await this.jumpConnection.connect();
 
-      // Open a forwardOut stream through the jump host
-      transportSocket = await this.jumpConnection.forwardOut(
-        '127.0.0.1',
-        0,
-        this.profile.host,
-        this.profile.port || 22
-      );
+        // Open a forwardOut stream through the jump host
+        transportSocket = await this.jumpConnection.forwardOut(
+          '127.0.0.1',
+          0,
+          this.profile.host,
+          this.profile.port || 22
+        );
+      }
     }
     // 2. Handle ProxyCommand
     else if (this.profile.proxyCommand) {
@@ -277,14 +290,19 @@ export class SSHConnection {
           throw new Error(`Private key file not found: ${resolved}`);
         }
       }
-      // If neither is specified, look for default id_ed25519 or id_rsa
+      // If neither is specified, check configured defaultKeyPath then standard ~/.ssh keys
       if (!privateKey) {
-        const defaultEd = path.join(os.homedir(), '.ssh', 'id_ed25519');
-        const defaultRsa = path.join(os.homedir(), '.ssh', 'id_rsa');
-        if (fs.existsSync(defaultEd)) {
-          privateKey = fs.readFileSync(defaultEd);
-        } else if (fs.existsSync(defaultRsa)) {
-          privateKey = fs.readFileSync(defaultRsa);
+        const candidates = [
+          ...(appConfig.defaultKeyPath ? [resolvePath(appConfig.defaultKeyPath, this.configManager.getConfigDir())] : []),
+          path.join(os.homedir(), '.ssh', 'id_ed25519'),
+          path.join(os.homedir(), '.ssh', 'id_rsa'),
+          path.join(os.homedir(), '.ssh', 'id_ecdsa')
+        ];
+        for (const candidate of candidates) {
+          if (fs.existsSync(candidate)) {
+            privateKey = fs.readFileSync(candidate);
+            break;
+          }
         }
       }
 
@@ -295,10 +313,36 @@ export class SSHConnection {
         }
       }
     } else if (this.profile.authType === 'agent') {
-      config.agent = process.env.SSH_AUTH_SOCK;
+      config.agent = resolveSshAgent();
     }
 
     return config;
+  }
+
+  private resolveJumpProfile(spec: string): HostProfile {
+    const saved = this.configManager.getHost(spec);
+    if (saved) return saved;
+
+    const looksInline = spec.includes('@') || spec.includes(':') || spec.includes('.') || spec.toLowerCase() === 'localhost';
+    if (!looksInline) {
+      throw new Error(`Jump host profile not found: "${spec}"`);
+    }
+
+    const parsed = parseInlineJumpTarget(spec);
+    if (!parsed) {
+      throw new Error(`Jump host profile not found: "${spec}"`);
+    }
+
+    const username = parsed.username || os.userInfo().username || 'root';
+    const port = parsed.port || 22;
+    return {
+      id: `jump:${username}@${parsed.host}:${port}`,
+      name: spec,
+      host: parsed.host,
+      port,
+      username,
+      authType: 'privateKey'
+    };
   }
 
   private createProxyCommandSocket(command: string): Duplex {
@@ -386,6 +430,40 @@ export class SSHConnection {
       return { success: false, latencyMs: -1, error: errorMessage(err) };
     }
   }
+}
+
+export function resolveSshAgent(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  if (env.SSH_AUTH_SOCK) return env.SSH_AUTH_SOCK;
+  if (platform === 'win32') return '\\\\.\\pipe\\openssh-ssh-agent';
+  return undefined;
+}
+
+function parseInlineJumpTarget(spec: string): { host: string; username?: string; port?: number } | null {
+  const at = spec.indexOf('@');
+  const username = at === -1 ? undefined : spec.slice(0, at);
+  let address = at === -1 ? spec : spec.slice(at + 1);
+  if (!address || (at !== -1 && (!username || address.includes('@')))) return null;
+
+  let port: number | undefined;
+  if (address.startsWith('[')) {
+    const bracketed = /^\[([^\]]+)\](?::(\d+))?$/.exec(address);
+    if (!bracketed || isIP(bracketed[1]) !== 6) return null;
+    address = bracketed[1];
+    if (bracketed[2] !== undefined) port = Number(bracketed[2]);
+  } else if (address.includes(':') && isIP(address) !== 6) {
+    const colon = address.lastIndexOf(':');
+    if (colon !== address.indexOf(':') || !address.slice(0, colon)) return null;
+    const portText = address.slice(colon + 1);
+    if (!/^\d+$/.test(portText)) return null;
+    port = Number(portText);
+    address = address.slice(0, colon);
+  }
+  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) return null;
+  if (!address || /[\s\[\]@]/.test(address)) return null;
+  return { host: address, username, port };
 }
 
 function resolvePath(filePath: string, baseDir?: string): string {

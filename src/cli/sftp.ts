@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { resolveTarget, ConnectCliOptions } from './connect.js';
+import { resolveTarget, prepareCliConnection, ConnectCliOptions } from './connect.js';
 import { SSHConnection } from '../core/client.js';
 import { SFTPClient, TransferProgress } from '../core/sftp.js';
 import { colors, formatBytes, renderTable } from './utils.js';
@@ -12,7 +12,7 @@ export interface SftpCliOptions extends ConnectCliOptions {
 
 export async function runSftpLs(target: string, remotePath: string = '.', options: SftpCliOptions = {}): Promise<void> {
   const profile = resolveTarget(target, options);
-  const conn = new SSHConnection({ profile });
+  const conn = new SSHConnection(await prepareCliConnection(profile));
 
   try {
     await conn.connect();
@@ -42,17 +42,20 @@ export async function runSftpGet(
   options: SftpCliOptions = {}
 ): Promise<void> {
   const profile = resolveTarget(target, options);
-  const conn = new SSHConnection({ profile });
+  const conn = new SSHConnection(await prepareCliConnection(profile));
 
   try {
     await conn.connect();
     const sftp = new SFTPClient(conn.getRawClient());
-    const dest = localPath || path.basename(remotePath);
+    let dest = localPath || path.posix.basename(remotePath);
 
     const stat = await sftp.stat(remotePath);
+    if (!stat.isDirectory && fs.existsSync(dest) && fs.statSync(dest).isDirectory()) {
+      dest = path.join(dest, path.posix.basename(remotePath));
+    }
     const onProgress = (p: TransferProgress) => {
       const speedStr = `${formatBytes(p.speedBps)}/s`;
-      process.stdout.write(`\rDownloading ${p.currentFile} [${p.percent}%] ${formatBytes(p.bytesTransferred)}/${formatBytes(p.totalBytes)} (${speedStr})`);
+      process.stdout.write(`\rDownloading ${p.currentFile} [${p.percent}%] ${formatBytes(p.bytesTransferred)}/${formatBytes(p.totalBytes)} (${speedStr})\x1b[K`);
     };
 
     if (stat.isDirectory) {
@@ -78,7 +81,7 @@ export async function runSftpPut(
   options: SftpCliOptions = {}
 ): Promise<void> {
   const profile = resolveTarget(target, options);
-  const conn = new SSHConnection({ profile });
+  const conn = new SSHConnection(await prepareCliConnection(profile));
 
   try {
     const resolvedLocal = path.resolve(localPath);
@@ -88,12 +91,22 @@ export async function runSftpPut(
 
     await conn.connect();
     const sftp = new SFTPClient(conn.getRawClient());
-    const dest = remotePath || path.basename(resolvedLocal);
+    let dest = remotePath || path.basename(resolvedLocal);
 
-    const stat = fs.statSync(resolvedLocal);
+    const stat = fs.lstatSync(resolvedLocal);
+    if (!stat.isDirectory() && remotePath) {
+      if (remotePath.endsWith('/')) {
+        dest = path.posix.join(remotePath, path.basename(resolvedLocal));
+      } else {
+        const remoteStat = await sftp.stat(remotePath).catch(() => undefined);
+        if (remoteStat?.isDirectory) {
+          dest = path.posix.join(remotePath, path.basename(resolvedLocal));
+        }
+      }
+    }
     const onProgress = (p: TransferProgress) => {
       const speedStr = `${formatBytes(p.speedBps)}/s`;
-      process.stdout.write(`\rUploading ${p.currentFile} [${p.percent}%] ${formatBytes(p.bytesTransferred)}/${formatBytes(p.totalBytes)} (${speedStr})`);
+      process.stdout.write(`\rUploading ${p.currentFile} [${p.percent}%] ${formatBytes(p.bytesTransferred)}/${formatBytes(p.totalBytes)} (${speedStr})\x1b[K`);
     };
 
     if (stat.isDirectory()) {
@@ -114,7 +127,7 @@ export async function runSftpPut(
 
 export async function runSftpRm(target: string, remotePath: string, options: SftpCliOptions = {}): Promise<void> {
   const profile = resolveTarget(target, options);
-  const conn = new SSHConnection({ profile });
+  const conn = new SSHConnection(await prepareCliConnection(profile));
 
   try {
     await conn.connect();

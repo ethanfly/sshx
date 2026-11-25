@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import { isIP } from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
+import ssh2 from 'ssh2';
 import { defaultConfigManager, HostProfile, resolvePortablePath } from '../core/config.js';
-import { SSHConnection } from '../core/client.js';
+import { ConnectionOptions, KeyboardInteractiveHandler, SSHConnection } from '../core/client.js';
 import { InteractiveSession } from '../core/session.js';
 import { SplitSession } from '../core/split-session.js';
 import { TunnelManager, parsePortForwardString } from '../core/tunnel.js';
@@ -137,17 +138,26 @@ export function resolveTarget(target: string, options: ConnectCliOptions = {}): 
   }
 
   // Parse [user@]hostname[:port], [user@][IPv6][:port], or a bare IPv6 address.
+  const appConfig = defaultConfigManager.getAppConfig();
   const address = parseAddress(target);
-  const username = options.user ?? address.username ?? os.userInfo().username ?? 'root';
+  const username = options.user ?? address.username ?? appConfig.defaultUsername ?? os.userInfo().username ?? 'root';
   const host = address.host;
-  const port = requestedPort ?? address.port ?? 22;
+  const port = requestedPort ?? address.port ?? appConfig.defaultPort ?? 22;
 
-  const defaultKey = path.join(os.homedir(), '.ssh', 'id_ed25519');
-  const defaultRsa = path.join(os.homedir(), '.ssh', 'id_rsa');
+  const keyCandidates = [
+    ...(appConfig.defaultKeyPath ? [resolvePortablePath(appConfig.defaultKeyPath, defaultConfigManager.getConfigDir())] : []),
+    path.join(os.homedir(), '.ssh', 'id_ed25519'),
+    path.join(os.homedir(), '.ssh', 'id_rsa'),
+    path.join(os.homedir(), '.ssh', 'id_ecdsa')
+  ];
   let privateKeyPath = options.identity;
   if (!privateKeyPath && !password) {
-    if (fs.existsSync(defaultKey)) privateKeyPath = defaultKey;
-    else if (fs.existsSync(defaultRsa)) privateKeyPath = defaultRsa;
+    for (const candidate of keyCandidates) {
+      if (fs.existsSync(candidate)) {
+        privateKeyPath = candidate;
+        break;
+      }
+    }
   }
 
   if (privateKeyPath) {
@@ -164,6 +174,87 @@ export function resolveTarget(target: string, options: ConnectCliOptions = {}): 
     password,
     privateKeyPath,
     proxyJump: options.jump
+  };
+}
+
+const SECRET_PROMPT = /password|passphrase|密码|口令/i;
+
+function keyNeedsPassphrase(profile: HostProfile): boolean {
+  let keyData: string | Buffer | undefined = profile.privateKey;
+  if (!keyData && profile.privateKeyPath) {
+    const resolved = resolvePortablePath(profile.privateKeyPath, defaultConfigManager.getConfigDir());
+    if (fs.existsSync(resolved)) {
+      try {
+        keyData = fs.readFileSync(resolved);
+      } catch {
+        return false;
+      }
+    }
+  }
+  if (!keyData) return false;
+  try {
+    const parsed = ssh2.utils.parseKey(keyData);
+    return parsed instanceof Error && /encrypted|passphrase/i.test(parsed.message);
+  } catch {
+    return false;
+  }
+}
+
+export async function prepareCliConnection(
+  profile: HostProfile,
+  options: { interactive?: boolean; promptPassword?: boolean } = {}
+): Promise<ConnectionOptions> {
+  const interactive = options.interactive ?? Boolean(process.stdin.isTTY);
+  const promptPassword = options.promptPassword ?? false;
+  const prepared: HostProfile = { ...profile };
+
+  if (promptPassword && !prepared.password && prepared.authType !== 'agent' && prepared.authType !== 'privateKey' && prepared.authType !== 'keyboard-interactive') {
+    prepared.password = await prompt(`${colors.cyan}${prepared.username}@${prepared.host}'s password: ${colors.reset}`, true);
+  }
+
+  if (interactive && prepared.authType === 'privateKey' && !prepared.passphrase && keyNeedsPassphrase(prepared)) {
+    const label = prepared.privateKeyPath || prepared.name;
+    prepared.passphrase = await prompt(`${colors.cyan}Enter passphrase for key '${label}': ${colors.reset}`, true);
+  }
+
+  const onBanner = interactive
+    ? (message: string) => {
+        if (message.trim()) process.stderr.write(`${colors.dim}${message.trimEnd()}${colors.reset}\n`);
+      }
+    : undefined;
+
+  const canHandleStoredPassword = Boolean(prepared.password && prepared.authType !== 'privateKey' && prepared.authType !== 'agent');
+  const onKeyboardInteractive: KeyboardInteractiveHandler | undefined = canHandleStoredPassword || interactive
+    ? (name, instructions, _lang, prompts, finish) => {
+        const allSecret = prompts.every(item => SECRET_PROMPT.test(item.prompt) || !item.echo);
+        if (prepared.password && prepared.authType === 'password' && allSecret) {
+          finish(prompts.map(() => prepared.password!));
+          return;
+        }
+        if (!interactive) {
+          finish([]);
+          return;
+        }
+        void (async () => {
+          try {
+            if (name) process.stderr.write(`${name}\n`);
+            if (instructions) process.stderr.write(`${instructions}\n`);
+            const answers: string[] = [];
+            for (const item of prompts) {
+              answers.push(await prompt(item.prompt, !item.echo));
+            }
+            finish(answers);
+          } catch {
+            finish([]);
+          }
+        })();
+      }
+    : undefined;
+
+  return {
+    profile: prepared,
+    onBanner,
+    onKeyboardInteractive
   };
 }
 
@@ -184,15 +275,21 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
     throw err;
   }
 
-  // Prompt only when this connection has no stored or supplied password.
-  if (!profile.password && profile.authType !== 'agent' && profile.authType !== 'privateKey') {
-    profile.password = await prompt(`${colors.cyan}${profile.username}@${profile.host}'s password: ${colors.reset}`, true);
-  }
+  const connectionOptions = await prepareCliConnection(profile, { promptPassword: true });
+  profile = connectionOptions.profile;
 
   process.stdout.write(`${colors.dim}Connecting to ${colors.reset}${colors.bold}${profile.username}@${profile.host}:${profile.port}${colors.reset}...\n`);
 
-  const connection = new SSHConnection({ profile });
+  const connection = new SSHConnection(connectionOptions);
   const tm = new TunnelManager(connection.getRawClient());
+  const appConfig = defaultConfigManager.getAppConfig();
+  const enableSidebar = options.sidebar !== undefined
+    ? options.sidebar
+    : appConfig.sidebarDefault === 'never'
+      ? false
+      : appConfig.sidebarDefault === 'always'
+        ? true
+        : undefined;
 
   try {
     await connection.connect();
@@ -228,8 +325,10 @@ export async function runConnect(target: string, options: RunConnectOptions = {}
 
     // Launch interactive split-pane session (Shell + Right monitor dashboard)
     const splitSession = new SplitSession(connection.getRawClient(), {
-      enableSidebar: options.sidebar,
-      recordFilePath: options.record
+      enableSidebar,
+      toggleHotkey: appConfig.sidebarHotkey,
+      recordFilePath: options.record,
+      env: profile.environment
     });
 
     await splitSession.start();
